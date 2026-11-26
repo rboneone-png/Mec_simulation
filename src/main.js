@@ -1,16 +1,17 @@
 import * as THREE from 'three';
 import { Viewer } from './viewer.js';
-import { loadStep } from './importers.js';
+import { loadStep, tessellateFine } from './importers.js';
 import { MATERIALS, CATEGORIES, cloneMaterial } from './materials.js';
-import { CONTACT_TYPES, DEFAULT_MU } from './fea/contact.js';
+import { CONTACT_TYPES, DEFAULT_MU, MU_PRESETS } from './fea/contact.js';
 import { serializeProject, parseProject, safeFileName, saveBlob, PROJECT_EXT, hasSavePicker, saveWithPicker } from './project.js';
 import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots.js';
+import { initInsertion, draw as drawInsertion, getInsertionState, setInsertionState, insertionReportData } from './insertion-ui.js';
 
 const $ = (id) => document.getElementById(id);
-const BC_LABEL = { fixed: '固定約束', force: '力', pressure: '壓力' };
-const BC_COLOR = { fixed: new THREE.Color('#2f7bff'), force: new THREE.Color('#ff5a4f'), pressure: new THREE.Color('#ff8a3d') };
+const BC_LABEL = { fixed: '固定約束', force: '力', pressure: '壓力', push: '推動面' };
+const BC_COLOR = { fixed: new THREE.Color('#2f7bff'), force: new THREE.Color('#ff5a4f'), pressure: new THREE.Color('#ff8a3d'), push: new THREE.Color('#2fbf71') };
 const MESH_NAME = { hex20: 'HEX20 貼體六面體（二次）', hex8: 'HEX8 貼體六面體', tet: 'TET10 四面體', voxel: 'HEX8 體素', tet10: 'TET10 四面體' };
-const RES_LABEL = { vm: 'von Mises 應力 [MPa]', umag: '總位移 [mm]', ux: '位移 Ux [mm]', uy: '位移 Uy [mm]', uz: '位移 Uz [mm]', pe: '等效塑性應變 PEEQ' };
+const RES_LABEL = { vm: 'von Mises 應力 [MPa]', umag: '總位移 [mm]', ux: '位移 Ux [mm]', uy: '位移 Uy [mm]', uz: '位移 Uz [mm]', pe: '等效塑性應變 PEEQ', cp: '接觸壓力 [MPa]' };
 
 const state = {
   files: [], // { name, bytes }
@@ -30,7 +31,11 @@ const state = {
   anim: { playing: false, t0: 0, lastStepT: 0 },
   showDeform: true,
   deformScale: 1,
+  page: 'fea',
+  // 插入模擬設定
+  ins3: { mode: 'insert', partId: null, dir: [0, 0, -1], stroke: null, steps: 30, start: 'final', mu: 0.2 },
 };
+const isInsert = () => state.page === 'ins3d';
 let bcSeq = 0;
 const viewer = new Viewer($('canvasHost'));
 viewer.setColormap(colormap, 12);
@@ -101,7 +106,7 @@ function faceInfo(soup) {
 const partById = (id) => state.parts.find((p) => p.id === id);
 const partIndex = (id) => state.parts.findIndex((p) => p.id === id);
 const modelSize = () => { const b = viewer.bounds(); return b.isEmpty() ? 100 : b.getSize(new THREE.Vector3()).length(); };
-const hasResults = () => state.results && !state.results.stale;
+const hasResults = () => !!state.results && !state.results.stale && !!state.results.insertion === isInsert();
 /** 結果使用的節點／元素（接觸設定可能拆開介面節點） */
 const RV = () => state.results.view;
 const vnOf = (rm) => (hasResults() ? RV().vn.get(rm.partId) : rm.vertexNode);
@@ -159,15 +164,25 @@ function invalidateResults(silent) {
 }
 
 // ---------- 上色 / 顯示 ----------
+/** 插入模擬：移動件節點的剛體平移（顯示變形時扣除／另加） */
+function rigidOf(n) {
+  const R = state.results, s = curStep();
+  return R.moving && s.rigid && R.moving[n] ? s.rigid : null;
+}
+function defU(n, d) {
+  const s = curStep(), rg = rigidOf(n);
+  return s.u[3 * n + d] - (rg ? rg[d] : 0);
+}
 function valueAt(n) {
   const s = curStep();
   switch (state.resultType) {
     case 'vm': return s.vm[n];
     case 'pe': return s.pe[n];
-    case 'umag': return Math.hypot(s.u[3 * n], s.u[3 * n + 1], s.u[3 * n + 2]);
-    case 'ux': return s.u[3 * n];
-    case 'uy': return s.u[3 * n + 1];
-    case 'uz': return s.u[3 * n + 2];
+    case 'cp': return s.cp ? s.cp[n] : 0;
+    case 'umag': return Math.hypot(defU(n, 0), defU(n, 1), defU(n, 2));
+    case 'ux': return defU(n, 0);
+    case 'uy': return defU(n, 1);
+    case 'uz': return defU(n, 2);
   }
   return 0;
 }
@@ -180,6 +195,12 @@ function resultRange() {
     const v = valueAt(n);
     if (v < lo) lo = v;
     if (v > hi) hi = v;
+  }
+  if (state.resultType === 'cp') {
+    // 接觸壓力：稜角處的局部尖峰會壓縮色階，取 99 百分位為上限
+    const v = [];
+    for (let n = 0; n < used.length; n++) if (used[n]) { const x = valueAt(n); if (x > 0) v.push(x); }
+    if (v.length > 20) { v.sort((a, b) => a - b); hi = v[Math.floor(v.length * 0.99)]; lo = 0; }
   }
   if (!(hi > lo)) hi = lo + 1e-12;
   return [lo, hi];
@@ -210,6 +231,7 @@ function repaint() {
         for (const key of bc.faces) { const [pid, fid] = key.split(':').map(Number); if (pid === p.id) faceColor.set(fid, c); }
       }
       if (p.id === state.selectedPartId && !state.activeBcId) base.lerp(new THREE.Color('#ffffff'), 0.18);
+      if (isInsert() && p.id === state.ins3.partId) base.lerp(new THREE.Color('#2fbf71'), 0.35);
       for (let t = 0; t < p.faceOfTri.length; t++) {
         const c = faceColor.get(p.faceOfTri[t]) || base;
         for (let k = 0; k < 3; k++) col.setXYZ(3 * t + k, c.r, c.g, c.b);
@@ -218,6 +240,7 @@ function repaint() {
       viewer.setPartVisible(p.id, p.visible, 1);
     }
     drawBcGlyphs();
+    drawInsertGlyph();
     viewer.setClip(null);
     viewer.setSection(null);
     viewer.setLabels(null);
@@ -251,6 +274,8 @@ function updateDeformation(scale) {
     for (let v = 0; v < vn.length; v++) {
       const n = vn[v];
       if (n < 0 || !used[n]) { pos.setXYZ(v, P[3 * v], P[3 * v + 1], P[3 * v + 2]); continue; }
+      const rg = rigidOf(n);
+      if (rg) { pos.setXYZ(v, P[3 * v] + rg[0] + scale * (u[3 * n] - rg[0]), P[3 * v + 1] + rg[1] + scale * (u[3 * n + 1] - rg[1]), P[3 * v + 2] + rg[2] + scale * (u[3 * n + 2] - rg[2])); continue; }
       pos.setXYZ(v, P[3 * v] + scale * u[3 * n], P[3 * v + 1] + scale * u[3 * n + 1], P[3 * v + 2] + scale * u[3 * n + 2]);
     }
     pos.needsUpdate = true;
@@ -258,7 +283,7 @@ function updateDeformation(scale) {
     g.computeBoundingSphere();
   }
   const N = RV().nodes;
-  const at = (n, d) => N[3 * n + d] + scale * u[3 * n + d];
+  const at = (n, d) => { const rg = rigidOf(n); return N[3 * n + d] + (rg ? rg[d] + scale * (u[3 * n + d] - rg[d]) : scale * u[3 * n + d]); };
   // 剖面
   const sec = state.section;
   if (sec && viewer.section) {
@@ -280,11 +305,11 @@ function updateWire(scale) {
   if (!$('showMesh').checked || !m || !m.wireNodes) { viewer.setWire(null); return; }
   const inRes = state.mode === 'result' && hasResults();
   const W = inRes ? RV().wire : m.wireNodes, N = inRes ? RV().nodes : m.nodes;
-  const u = scale && hasResults() ? curStep().u : null;
+  const u = inRes ? curStep().u : null;
   const out = new Float32Array(W.length * 3);
   for (let i = 0; i < W.length; i++) {
-    const n = W[i];
-    for (let d = 0; d < 3; d++) out[3 * i + d] = N[3 * n + d] + (u ? scale * u[3 * n + d] : 0);
+    const n = W[i], rg = u ? rigidOf(n) : null;
+    for (let d = 0; d < 3; d++) out[3 * i + d] = N[3 * n + d] + (rg ? rg[d] + scale * (u[3 * n + d] - rg[d]) : u ? scale * u[3 * n + d] : 0);
   }
   viewer.setWire(out);
 }
@@ -318,6 +343,8 @@ function buildSection(range) {
   normal[axis] = flip ? 1 : -1;
   viewer.setClip({ normal, constant: flip ? -c : c });
   state.clip = { axis, c, keepGreater: flip };
+  // 接觸壓力只存在於表面：不畫剖切面，直接看剖開後的孔壁／接觸面
+  if (state.resultType === 'cp') { viewer.setSection(null); return; }
 
   const nen = m.elems.length / m.elemPart.length;
   const isTet = m.type === 'tet10';
@@ -374,8 +401,8 @@ function updateLabels() {
     }
   }
   if (nMax < 0) { viewer.setLabels(null); return; }
-  const unit = { vm: ' MPa', pe: '', umag: ' mm', ux: ' mm', uy: ' mm', uz: ' mm' }[state.resultType];
-  const N = RV().nodes, P = (n) => [N[3 * n], N[3 * n + 1], N[3 * n + 2]];
+  const unit = { vm: ' MPa', pe: '', cp: ' MPa', umag: ' mm', ux: ' mm', uy: ' mm', uz: ' mm' }[state.resultType];
+  const N = RV().nodes, P = (n) => { const rg = rigidOf(n); return [0, 1, 2].map((d) => N[3 * n + d] + (rg ? rg[d] : 0)); };
   viewer.setLabels([
     { pos: P(nMax), text: `MAX ${fmt(vMax, 4)}${unit}`, color: '#ff4d4d' },
     { pos: P(nMin), text: `MIN ${fmt(vMin, 4)}${unit}`, color: '#3d7bff' },
@@ -391,10 +418,24 @@ function drawBcGlyphs() {
       const part = partById(pid);
       if (!part || !part.visible) continue;
       const { centroid, normal } = faceInfo(faceSoup(part, fid));
+      if (bc.type === 'push') { if (isInsert()) viewer.addArrow(centroid.clone().sub(new THREE.Vector3(...state.ins3.dir).multiplyScalar(L)), new THREE.Vector3(...state.ins3.dir), L, 0x2fbf71); continue; }
       if (bc.type === 'fixed') viewer.addFixMarker(centroid.clone().add(normal.clone().multiplyScalar(L * 0.25)), L * 0.35);
       else if (bc.type === 'pressure') viewer.addArrow(centroid, normal.clone().negate().multiplyScalar(Math.sign(bc.p) || 1), L, 0xff8a3d);
       else { const v = new THREE.Vector3(...bc.vector); if (v.lengthSq() > 0) viewer.addArrow(centroid, v, L, 0xff5a4f); }
     }
+}
+
+/** 插入模擬：在插入件上顯示插入方向與行程 */
+function drawInsertGlyph() {
+  if (!isInsert()) return;
+  const p = partById(state.ins3.partId);
+  if (!p || !p.visible) return;
+  const dir = new THREE.Vector3(...state.ins3.dir).normalize();
+  const c = new THREE.Vector3((p.bbox[0] + p.bbox[3]) / 2, (p.bbox[1] + p.bbox[4]) / 2, (p.bbox[2] + p.bbox[5]) / 2);
+  const ext = new THREE.Vector3(p.bbox[3] - p.bbox[0], p.bbox[4] - p.bbox[1], p.bbox[5] - p.bbox[2]);
+  const half = Math.abs(ext.x * dir.x) / 2 + Math.abs(ext.y * dir.y) / 2 + Math.abs(ext.z * dir.z) / 2;
+  const L = Math.max(modelSize() * 0.12, (+state.ins3.stroke || 0));
+  viewer.addArrow(c.clone().sub(dir.clone().multiplyScalar(half + L * 1.05)), dir, L, 0x2fbf71);
 }
 
 function updateLegend(range) {
@@ -460,6 +501,7 @@ function renderMaterial() {
 }
 
 function bcDesc(bc) {
+  if (bc.type === 'push') return '沿插入方向推動';
   if (bc.type === 'force') return `${fmt(Math.hypot(...bc.vector))} N`;
   if (bc.type === 'pressure') return `${fmt(bc.p)} MPa`;
   const d = bc.dirs || [true, true, true];
@@ -472,8 +514,10 @@ function renderBcs() {
   for (const bc of state.bcs) {
     const el = document.createElement('div');
     el.className = 'item' + (bc.id === state.activeBcId ? ' sel' : '');
+    const unused = isInsert() ? bc.type === 'force' || bc.type === 'pressure' : bc.type === 'push';
+    if (unused) el.style.opacity = 0.5;
     el.innerHTML = `<span class="tag ${bc.type}">${BC_LABEL[bc.type]}</span>
-      <span class="name"></span><span class="meta">${bc.faces.size} 面・${bcDesc(bc)}</span>
+      <span class="name"></span><span class="meta">${bc.faces.size} 面・${bcDesc(bc)}${unused ? `（${isInsert() ? '插入模擬' : '結構模擬'}不使用）` : ''}</span>
       <button class="x" title="刪除">✕</button>`;
     el.querySelector('.name').textContent = bc.name;
     el.onclick = () => { state.activeBcId = state.activeBcId === bc.id ? null : bc.id; setMode('model'); renderAll(); };
@@ -581,6 +625,7 @@ function renderResults() {
     總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N${r.contact ? `<br>介面節點閉合 ${r.contact.closed}/${r.contact.springs}${r.contact.sliding ? `（其中滑動 ${r.contact.sliding}）` : ''}・最大穿透 ${fmt(r.contact.maxPen)} mm` : ''}</td></tr>`;
   $('statsTable').innerHTML = html;
 
+  if (r.insertion) { renderInsertResults(r, s); return; }
   // 負載-位移曲線
   const F = Math.hypot(...r.totalLoad);
   const pts = [[0, 0], ...r.steps.map((x) => [x.maxU, x.lambda * F])];
@@ -588,9 +633,32 @@ function renderResults() {
   if (multi) drawCurve($('ldChart'), pts, state.step + 1, '最大位移 [mm]', '負載 [N]', '負載-位移曲線');
 }
 
+function renderInsertResults(r, s) {
+  const I = r.insertion;
+  const K = I.mode === 'pull' ? '拔出' : '插入';
+  const pts = [[0, 0], ...r.steps.map((x) => [x.insert.stroke, x.insert.force])];
+  const iMax = r.steps.reduce((b, x, i) => (x.insert.force > r.steps[b].insert.force ? i : b), 0);
+  $('stepVal').textContent = `${state.step + 1} / ${r.steps.length}（行程 ${fmt(s.insert.stroke)} mm）`;
+  const p = state.parts[I.moving];
+  const head = `<tr><td colspan="4"><div class="ins-kpi">
+    <div>最大${K}力<b>${fmt(I.Fmax)} N</b>${fmt(I.Fmax / 9.80665)} kgf・行程 ${fmt(r.steps[iMax].insert.stroke)} mm</div>
+    <div>目前${K}力<b>${fmt(s.insert.force)} N</b>行程 ${fmt(s.insert.stroke)} / ${fmt(I.stroke)} mm</div>
+    <div>接觸法向力合計<b>${fmt(s.insert.Fn)} N</b>摩擦力估算 μ·ΣFn ≈ ${fmt(I.mu * s.insert.Fn)} N</div>
+    <div>接觸節點<b>${s.insert.nAct}</b>其中滑動 ${s.insert.nSlip}</div>
+  </div></td></tr>`;
+  $('statsTable').innerHTML = head + $('statsTable').innerHTML.replace(/總負載 \([^)]*\) N/, `${K}件：${p?.name ?? ''}・μ = ${fmt(I.mu)}・推動面 ${I.pushNodes} 節點`);
+  $('ldChart').hidden = false;
+  drawCurve($('ldChart'), pts, state.step + 1, `${K}行程 [mm]`, `${K}力 [N]`, `${K}力-行程曲線`);
+}
+
 function renderAll() {
   const plasticUI = $('anaType').value === 'plastic';
   document.body.classList.toggle('plastic', plasticUI);
+  document.body.classList.toggle('sim-insert', isInsert());
+  renderInsSetup();
+  const cpOpt = $('resType').querySelector('[value=cp]');
+  cpOpt.disabled = !(hasResults() && state.results.insertion);
+  if (cpOpt.disabled && state.resultType === 'cp') { state.resultType = 'vm'; $('resType').value = 'vm'; }
   $('animType').querySelector('[value=steps]').disabled = !(hasResults() && state.results.steps.length > 1);
   if ($('animType').querySelector('[value=steps]').disabled && $('animType').value === 'steps') $('animType').value = 'deform';
   const peOpt = $('resType').querySelector('[value=pe]');
@@ -665,6 +733,7 @@ function autoMeshSize() {
   if (b.isEmpty()) return 5;
   const s = b.getSize(new THREE.Vector3());
   const m = $('meshMethod').value;
+  if (isInsert()) return s.length() / 22; // 插入模擬：TET10 求解較重，預設稍粗
   return m === 'hex8' ? s.length() / 60 : s.length() / 30;
 }
 
@@ -681,13 +750,20 @@ function onProgress(m) {
 
 async function generateMesh() {
   if (!state.parts.length) throw new Error('請先載入模型');
-  const method = $('meshMethod').value;
+  const separate = isInsert();
+  // 插入／拔出模擬固定用 TET10：表面貼合 CAD（< 0.001 mm），貼體六面體的品質鬆弛會造成大於干涉量的表面誤差
+  const method = separate ? 'tet' : $('meshMethod').value;
   const size = +$('meshSize').value || autoMeshSize();
-  const data = {
-    method, size,
-    parts: state.parts.map((p) => ({ name: p.name, bbox: p.bbox, positions: p.basePositions, faceOfTri: p.faceOfTri })),
-  };
-  log(`產生網格（${MESH_NAME[method]}，尺寸 ${fmt(size)} mm）…`);
+  let parts = state.parts.map((p) => ({ name: p.name, bbox: p.bbox, positions: p.basePositions, faceOfTri: p.faceOfTri }));
+  if (separate) {
+    // 插入模擬：以高精度三角化產生網格（干涉量常小於一般三角化的弦高誤差）
+    onProgress({ stage: '高精度三角化 STEP', frac: 0.02 });
+    const fine = new Map();
+    for (const fi of new Set(state.parts.map((p) => p.fileIdx))) fine.set(fi, await tessellateFine(state.files[fi].bytes));
+    parts = state.parts.map((p, i) => { const t = fine.get(p.fileIdx)?.[p.meshIdx]; return t ? { name: p.name, ...t } : parts[i]; });
+  }
+  const data = { method, size, separate, parts };
+  log(`產生網格（${MESH_NAME[method]}，尺寸 ${fmt(size)} mm${separate ? '，各零件獨立網格' : ''}）…`);
   const res = await fea.call('mesh', data, onProgress);
   const wire = [];
   res.display.forEach((d) => { if (d.wire) for (const n of d.wire) wire.push(n); });
@@ -710,13 +786,14 @@ async function meshOnly() {
 
 // ---------- 求解 ----------
 async function runSimulation() {
+  if (isInsert()) return runInsertion();
   if (!state.parts.length) return alert('請先載入模型');
   if (!state.bcs.some((b) => b.type === 'fixed' && b.faces.size)) return alert('請至少設定一個「固定約束」並選取面');
   if (!state.bcs.some((b) => b.type !== 'fixed' && b.faces.size)) return alert('請至少設定一個「力」或「壓力」負載並選取面');
   showProgress(true);
   try {
-    if (!state.mesh) await generateMesh();
-    const bcs = state.bcs.filter((b) => b.faces.size).map((b) => ({
+    if (!state.mesh || state.mesh.separate) await generateMesh();
+    const bcs = state.bcs.filter((b) => b.faces.size && b.type !== 'push').map((b) => ({
       name: b.name, type: b.type, dirs: b.dirs, vector: b.vector, p: b.p,
       faces: [...b.faces].map((k) => { const [pid, fid] = k.split(':').map(Number); return { part: partIndex(pid), faceId: fid, soup: faceSoup(partById(pid), fid) }; }),
     }));
@@ -747,6 +824,108 @@ async function runSimulation() {
   }
 }
 
+// ---------- 插入模擬 ----------
+const bcPayload = (b) => ({
+  name: b.name, type: b.type, dirs: b.dirs, vector: b.vector, p: b.p,
+  faces: [...b.faces].map((k) => { const [pid, fid] = k.split(':').map(Number); return { part: partIndex(pid), faceId: fid, soup: faceSoup(partById(pid), fid) }; }),
+});
+
+async function runInsertion() {
+  if (state.parts.length < 2) return alert('插入模擬需要至少 2 個零件（插入件與被插入件）');
+  const I = state.ins3;
+  if (!partById(I.partId)) return alert('請選擇插入件');
+  if (!(I.stroke > 0)) return alert('請輸入插入行程（或按「自動」）');
+  showProgress(true);
+  try {
+    if (!state.mesh || !state.mesh.separate) await generateMesh();
+    const bcs = state.bcs.filter((b) => b.faces.size && (b.type === 'fixed' || b.type === 'push')).map(bcPayload);
+    const plastic = $('anaType').value === 'plastic';
+    const setup = { materials: state.parts.map((p) => ({ ...p.material, name: p.name })), plastic, tol: +$('tol').value };
+    const insertion = { mode: I.mode, moving: partIndex(I.partId), dir: I.dir, stroke: +I.stroke, steps: Math.max(4, +I.steps | 0), start: I.start, mu: +I.mu };
+    log(`開始${I.mode === 'pull' ? '拔出' : '插入'}模擬（${plastic ? '彈塑性' : '線彈性'}，行程 ${fmt(insertion.stroke)} mm／${insertion.steps} 段，μ = ${insertion.mu}）…`);
+    const r = await fea.call('insert', { bcs, setup, insertion }, onProgress);
+    // 移動件節點遮罩（顯示時扣除剛體平移）
+    const nNode = state.mesh.nodes.length / 3, moving = new Uint8Array(nNode);
+    const nen = state.mesh.elems.length / state.mesh.elemPart.length;
+    for (let e = 0; e < state.mesh.elemPart.length; e++) if (state.mesh.elemPart[e] === insertion.moving) for (let k = 0; k < nen; k++) moving[state.mesh.elems[e * nen + k]] = 1;
+    state.results = { ...r, stale: false, moving, view: buildResultView(r) };
+    const iMax = r.steps.reduce((b, x, i) => (x.insert.force > r.steps[b].insert.force ? i : b), 0);
+    state.step = r.steps.length - 1;
+    state.deformScale = 1;
+    $('deformScale').value = 1;
+    $('animType').value = 'steps';
+    // 接觸面在零件內部：自動以通過插入軸的剖面顯示
+    const ax = insertion.dir.findIndex((v) => v !== 0);
+    state.secAxis = ax === 0 ? 1 : 0;
+    for (const b of $('secAxis').querySelectorAll('button')) b.classList.toggle('on', +b.dataset.axis === state.secAxis);
+    $('secPos').value = 500;
+    $('secOn').checked = true;
+    for (const w of r.warnings) log(w, 'w');
+    log(`完成：${r.stats.seconds.toFixed(1)} s，最大${I.mode === 'pull' ? '拔出' : '插入'}力 ${fmt(r.insertion.Fmax)} N（行程 ${fmt(r.steps[iMax].insert.stroke)} mm），最大 σvm ${fmt(Math.max(...r.steps.map((x) => x.maxVM)))} MPa`);
+    setMode('result');
+  } catch (e) {
+    if (e.message !== '已取消') { log(`錯誤：${e.message}`, 'e'); console.error(e); }
+  } finally {
+    showProgress(false);
+    renderAll();
+  }
+}
+
+/** 自動判斷：插入件預設為體積最小者；方向由插入件指向其他零件；行程為沿方向的重疊深度 */
+function autoInsert(force = false) {
+  const I = state.ins3;
+  if (state.parts.length < 2) return;
+  if (!partById(I.partId) || force) I.partId = [...state.parts].sort((a, b) => a.volume - b.volume)[0].id;
+  const mv = partById(I.partId), others = state.parts.filter((p) => p !== mv);
+  const ctr = (bb) => [(bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2, (bb[2] + bb[5]) / 2];
+  const ob = [0, 1, 2].map((d) => Math.min(...others.map((p) => p.bbox[d]))).concat([0, 1, 2].map((d) => Math.max(...others.map((p) => p.bbox[3 + d]))));
+  const a = ctr(mv.bbox), b = ctr(ob);
+  const dv = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  let ax = 0;
+  for (let d = 1; d < 3; d++) if (Math.abs(dv[d]) > Math.abs(dv[ax])) ax = d;
+  const dir = [0, 0, 0];
+  dir[ax] = dv[ax] >= 0 ? 1 : -1;
+  I.dir = dir;
+  // 沿方向的投影範圍
+  const range = (p) => { let lo = Infinity, hi = -Infinity; const P = p.basePositions; for (let i = 0; i < P.length; i += 3) { const v = P[i + ax] * dir[ax]; if (v < lo) lo = v; if (v > hi) hi = v; } return [lo, hi]; };
+  const [mlo, mhi] = range(mv);
+  let tlo = Infinity, thi = -Infinity;
+  for (const p of others) { const [l, h2] = range(p); tlo = Math.min(tlo, l); thi = Math.max(thi, h2); }
+  // 插入（CAD 為完成位置）與拔出：行程 = 重疊深度；插入（CAD 為起點）：到被插入件另一端
+  const S = I.mode === 'pull' || I.start === 'final' ? mhi - tlo : thi - mhi;
+  I.stroke = +Math.max(0, S).toPrecision(4) || +(0.5 * (mhi - mlo)).toPrecision(3);
+  const h = +$('meshSize').value || autoMeshSize();
+  I.steps = Math.min(120, Math.max(16, Math.ceil((I.stroke / h) * 3)));
+}
+
+function renderInsSetup() {
+  if (!isInsert()) return;
+  const I = state.ins3;
+  if (state.parts.length >= 2 && !partById(I.partId)) autoInsert();
+  document.body.classList.toggle('ins-pull', I.mode === 'pull');
+  for (const b of $('ins3Mode').querySelectorAll('button')) b.classList.toggle('on', b.dataset.m === I.mode);
+  $('ins3Part').innerHTML = state.parts.map((p) => `<option value="${p.id}">${p.name}</option>`).join('');
+  if (I.partId) $('ins3Part').value = I.partId;
+  for (const b of $('ins3Dir').querySelectorAll('button')) b.classList.toggle('on', b.dataset.d === I.dir.join(','));
+  if (document.activeElement !== $('ins3Stroke')) $('ins3Stroke').value = I.stroke ?? '';
+  $('ins3Steps').value = I.steps;
+  $('ins3Start').value = I.start;
+  if (document.activeElement !== $('ins3Mu')) $('ins3Mu').value = I.mu;
+}
+
+$('ins3MuPreset').innerHTML = '<option value="">選擇…</option>' + MU_PRESETS.map(([n, v]) => `<option value="${v}">${n}：${v}</option>`).join('')
+  + ['PC–PC：0.5', 'ABS–ABS：0.5', 'PA–PA：0.35', 'POM–POM：0.25', 'POM–鋼：0.2', 'PC／ABS–鋼：0.4', 'PP–鋼：0.3'].map((t) => `<option value="${t.split('：')[1]}">${t}</option>`).join('');
+const insChanged = () => { invalidateResults(); renderAll(); };
+for (const b of $('ins3Mode').querySelectorAll('button')) b.onclick = () => { state.ins3.mode = b.dataset.m; autoInsert(); insChanged(); };
+$('ins3Part').onchange = () => { state.ins3.partId = +$('ins3Part').value; autoInsert(); insChanged(); };
+for (const b of $('ins3Dir').querySelectorAll('button')) b.onclick = () => { state.ins3.dir = b.dataset.d.split(',').map(Number); insChanged(); };
+$('ins3Auto').onclick = () => { autoInsert(); insChanged(); log(`自動判斷：插入件「${partById(state.ins3.partId)?.name}」、方向 (${state.ins3.dir.join(', ')})、行程 ${state.ins3.stroke} mm`); };
+$('ins3Stroke').onchange = () => { state.ins3.stroke = Math.max(0, +$('ins3Stroke').value || 0); insChanged(); };
+$('ins3Steps').onchange = () => { state.ins3.steps = Math.min(200, Math.max(4, +$('ins3Steps').value | 0)); insChanged(); };
+$('ins3Start').onchange = () => { state.ins3.start = $('ins3Start').value; autoInsert(); insChanged(); };
+$('ins3Mu').onchange = () => { state.ins3.mu = Math.max(0, +$('ins3Mu').value || 0); insChanged(); };
+$('ins3MuPreset').onchange = (e) => { if (e.target.value) { state.ins3.mu = +e.target.value; e.target.value = ''; insChanged(); } };
+
 /** 依求解回傳的節點拆分資訊，建立結果顯示用的節點／元素／頂點對照 */
 function buildResultView(r) {
   const m = state.mesh;
@@ -767,11 +946,6 @@ const contactType = (I) => state.contacts[pairKey(I)] || 'bonded';
 const contactMu = (I) => state.contactMu[pairKey(I)] ?? DEFAULT_MU;
 const contactLabel = (I) => CONTACT_TYPES[contactType(I)] + (contactType(I) === 'frictional' ? `，μ = ${contactMu(I)}` : '');
 // 常見材料組合的靜摩擦係數（典型值，實際依表面處理、潤滑而異）
-const MU_PRESETS = [
-  ['鋼–鋼（乾燥、一般加工面）', 0.3], ['鋼–鋼（潤滑）', 0.1], ['鋼–鋼（噴砂／粗糙面）', 0.5],
-  ['鋁–鋼', 0.45], ['鋁–鋁（乾燥）', 0.5], ['銅–鋼', 0.5], ['鑄鐵–鋼', 0.2],
-  ['工程塑膠（POM／PA）–鋼', 0.2], ['PTFE–鋼', 0.05], ['橡膠–鋼', 0.8],
-];
 
 function renderContacts() {
   const box = $('contactBox');
@@ -876,6 +1050,7 @@ function findFace(part, dir) {
 }
 
 $('btnDemo').onclick = () => withBusy('載入示範組合件…', async () => {
+  if (isInsert()) return loadInsertDemo();
   clearAll();
   const res = await fetch('samples/demo_assembly.step');
   if (!res.ok) throw new Error('無法載入示範檔');
@@ -887,6 +1062,22 @@ $('btnDemo').onclick = () => withBusy('載入示範組合件…', async () => {
   renderAll();
   log('已載入示範組合件（3 件，含預設邊界條件）');
 });
+/** 插入示範：鋼銷（S45C，Ø10.2、導角）壓入 POM 軸套（內徑 10、外徑 20、長 10），直徑干涉 0.2 mm */
+async function loadInsertDemo() {
+  clearAll();
+  const res = await fetch('samples/press_fit.step');
+  if (!res.ok) throw new Error('無法載入示範檔');
+  const parts = await importFile(new File([await res.arrayBuffer()], 'press_fit.step'));
+  const pin = parts.reduce((a, b) => (a.bbox[5] > b.bbox[5] ? a : b)), hub = parts.find((p) => p !== pin);
+  pin.name = '鋼銷 Ø10.2'; pin.material = cloneMaterial('s45c');
+  hub.name = 'POM 軸套 Ø10'; hub.material = cloneMaterial('pom');
+  state.bcs.push({ id: ++bcSeq, type: 'fixed', name: '軸套底面固定', faces: new Set([`${hub.id}:${findFace(hub, new THREE.Vector3(0, 0, -1))}`]), vector: [0, 0, 0], p: 0, dirs: [true, true, true] });
+  Object.assign(state.ins3, { partId: pin.id, mu: 0.2, start: 'final' });
+  autoInsert();
+  $('meshSize').value = 1.5;
+  renderAll();
+  log(`已載入插入示範：鋼銷壓入 POM 軸套（直徑干涉 0.2 mm），方向 (${state.ins3.dir.join(', ')})、行程 ${state.ins3.stroke} mm`);
+}
 $('btnClear').onclick = () => { if (!state.parts.length || confirm('清除所有零件與設定？')) clearAll(); };
 
 for (const btn of document.querySelectorAll('[data-add]'))
@@ -1010,15 +1201,17 @@ function currentSettings() {
   return {
     meshMethod: $('meshMethod').value, meshSize: $('meshSize').value, anaType: $('anaType').value,
     loadFactor: $('loadFactor').value, nSteps: $('nSteps').value, tol: $('tol').value, bands: $('bands').value,
+    page: state.page, insertion: getInsertionState(),
+    ins3: { ...state.ins3, part: partIndex(state.ins3.partId) },
   };
 }
 
 async function saveProject() {
-  if (!state.parts.length) return alert('目前沒有模型可儲存');
+  if (!state.parts.length && state.page !== 'ins') return alert('目前沒有模型可儲存');
   let size = 0;
   const name = await saveNamed({
     title: '儲存專案', def: projName(), ext: PROJECT_EXT, mime: 'application/json', desc: 'MecSim 專案檔',
-    hint: '包含 STEP 幾何、材料、邊界條件、零件結合與分析設定（不含計算結果）。',
+    hint: '包含 STEP 幾何、材料、邊界條件、零件結合、分析設定與插入力計算參數（不含計算結果）。',
     makeBlob: (n) => { const json = JSON.stringify(serializeProject(state, n, currentSettings())); size = json.length; return new Blob([json], { type: 'application/json' }); },
   });
   if (!name) return;
@@ -1063,11 +1256,14 @@ async function openProject(file) {
   for (const [k, el] of [['meshMethod', 'meshMethod'], ['meshSize', 'meshSize'], ['anaType', 'anaType'], ['loadFactor', 'loadFactor'], ['nSteps', 'nSteps'], ['tol', 'tol'], ['bands', 'bands']])
     if (S[k] !== undefined) $(el).value = S[k];
   viewer.setColormap(colormap, +$('bands').value);
+  if (S.insertion) setInsertionState(S.insertion);
+  if (S.ins3) { const { part, ...rest } = S.ins3; Object.assign(state.ins3, rest, { partId: ordered[part]?.id ?? null }); }
+  if (S.page) setPage(S.page);
   $('projName').value = P.name || file.name.replace(/\.[^.]+$/, '');
   state.selectedPartId = ordered[0]?.id ?? null;
   viewer.setParts(state.parts);
   renderAll();
-  viewer.fit(new THREE.Vector3(1, -1.2, 0.9));
+  if (ordered.length) viewer.fit(new THREE.Vector3(1, -1.2, 0.9));
   log(`已開啟專案：${file.name}（${ordered.length} 個零件、${state.bcs.length} 個邊界條件）`);
 }
 
@@ -1162,13 +1358,43 @@ function reportData(name) {
       `${R.stats.type.toUpperCase()}・元素 ${R.stats.elements.toLocaleString()}・自由度 ${R.stats.dofs.toLocaleString()}・求解 ${R.stats.seconds.toFixed(1)} s`,
       ...(R.contact ? [`介面節點閉合 ${R.contact.closed}/${R.contact.springs}${R.contact.sliding ? `（其中摩擦滑動 ${R.contact.sliding}）` : ''}，最大穿透 ${fmt(R.contact.maxPen)} mm`] : []),
       ...(plastic ? [] : ['安全係數 = 降伏強度 / 最大 von Mises 應力（<1 紅、<1.5 橘）']),
+      ...(R.insertion ? (() => {
+        const I = R.insertion, K = I.mode === 'pull' ? '拔出' : '插入';
+        const iMax = R.steps.reduce((b, x, i) => (x.insert.force > R.steps[b].insert.force ? i : b), 0);
+        return [`${K}模擬：${K}件「${state.parts[I.moving]?.name}」、行程 ${fmt(I.stroke)} mm、μ = ${fmt(I.mu)}`,
+          `最大${K}力 ${fmt(I.Fmax)} N（${fmt(I.Fmax / 9.80665)} kgf），發生於行程 ${fmt(R.steps[iMax].insert.stroke)} mm；顯示行程 ${fmt(s.insert.stroke)} mm 時 ${K}力 ${fmt(s.insert.force)} N、接觸法向力合計 ${fmt(s.insert.Fn)} N`];
+      })() : []),
     ];
     data.results = { cols, rows, notes, warnings: R.warnings || [] };
   }
   return data;
 }
 
+async function exportInsertionPdf() {
+  let pages = 0, kb = 0, name = null;
+  try {
+    name = await saveNamed({
+      title: '存 PDF 報告（插入力計算）', def: `${projName()} 插入力計算`, ext: '.pdf', mime: 'application/pdf', desc: 'PDF 報告',
+      hint: '包含輸入條件、計算結果、插入力曲線、應力-應變工作點與計算方法。',
+      makeBlob: async (n) => {
+        let blob;
+        await withBusy('產生 PDF 報告中…', async () => {
+          const d = insertionReportData();
+          if (!d) throw new Error('目前參數無法計算，請先修正輸入');
+          const { buildInsertionPdf } = await import('./report.js');
+          const r = await buildInsertionPdf({ ...d, name: n, date: new Date().toLocaleString('zh-TW', { hour12: false }) });
+          pages = r.pages; kb = r.blob.size / 1024; blob = r.blob;
+        });
+        if (!blob) throw new Error('PDF 產生失敗');
+        return blob;
+      },
+    });
+  } catch (e) { alert(`錯誤：${e.message}`); }
+  if (name) log(`已輸出插入力 PDF 報告：${safeFileName(name)}.pdf（${pages} 頁，${kb.toFixed(0)} KB）`);
+}
+
 async function exportPdf() {
+  if (state.page === 'ins') return exportInsertionPdf();
   if (!state.parts.length) return alert('目前沒有模型可輸出');
   let pages = 0, kb = 0;
   const build = async (name) => {
@@ -1182,6 +1408,7 @@ async function exportPdf() {
         ['vm', front, '圖 3　von Mises 應力分布（前視圖）'],
       ];
       if (state.results.stats.plastic) shots.push(['pe', iso, '圖 4　等效塑性應變 PEEQ']);
+      if (state.results.insertion) shots.push(['cp', iso, `圖 ${shots.length + 1}　接觸壓力分布`]);
       for (const [rt, dir, cap] of shots) { const c = captureView({ dir, resultType: rt, mode: 'result' }); data.images.push({ img: c.img, caption: cap, legend: c.legend }); }
       const ld = chartImage($('ldChart'));
       if (ld) data.charts.push({ img: ld, caption: '負載-位移曲線' });
@@ -1304,4 +1531,26 @@ $('hiQ').onchange = () => viewer.setHighQuality($('hiQ').checked);
 renderAll();
 
 // 除錯／自動化測試用
-window.mecsim = { state, renderAll, runSimulation, generateMesh, viewer, faceSoup, faceInfo, findFace };
+// ---------- 分頁 ----------
+function setPage(page) {
+  const prev = state.page;
+  state.page = ['ins', 'ins3d'].includes(page) ? page : 'fea';
+  const ins = state.page === 'ins';
+  document.body.classList.toggle('page-ins', ins);
+  $('feaPage').hidden = ins;
+  $('insPage').hidden = !ins;
+  for (const b of $('pageTabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.page === state.page);
+  if (state.anim?.playing) setPlaying(false);
+  if (ins) requestAnimationFrame(drawInsertion);
+  else {
+    if (prev !== state.page) { setMode(hasResults() ? 'result' : 'model'); renderAll(); }
+    requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+  }
+  try { localStorage.setItem('mecsim.page', state.page); } catch {}
+}
+for (const b of $('pageTabs').querySelectorAll('button')) b.onclick = () => setPage(b.dataset.page);
+initInsertion();
+state.page = 'fea';
+try { const pg = localStorage.getItem('mecsim.page'); if (pg === 'ins' || pg === 'ins3d') setPage(pg); } catch {}
+
+window.mecsim = { state, setPage, renderAll, runSimulation, generateMesh, viewer, faceSoup, faceInfo, findFace };

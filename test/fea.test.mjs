@@ -8,6 +8,10 @@ import { detectInterfaces, applyInterfaces } from '../src/fea/contact.js';
 import { buildLoads } from '../src/fea/bc.js';
 import { solveStatic } from '../src/fea/solver.js';
 import { hardeningTable } from '../src/fea/plasticity.js';
+import { pressFit, snapFit } from '../src/insertion.js';
+import { meshSeparately } from '../src/fea/mesh-separate.js';
+import { createNTS } from '../src/fea/nts.js';
+import { MATERIALS } from '../src/materials.js';
 
 const require = createRequire(import.meta.url);
 const occt = await require('occt-import-js')();
@@ -20,8 +24,8 @@ const check = (name, val, ref, tol) => {
 };
 
 /** 用 occt-import-js 讀 STEP，回傳每個實體的 CAD 面（與瀏覽器端相同流程） */
-function loadStep(path) {
-  const r = occt.ReadStepFile(new Uint8Array(fs.readFileSync(path)), { linearUnit: 'millimeter', linearDeflectionType: 'bounding_box_ratio', linearDeflection: 0.001, angularDeflection: 0.35 });
+function loadStep(path, fine = false) {
+  const r = occt.ReadStepFile(new Uint8Array(fs.readFileSync(path)), fine ? { linearUnit: 'millimeter', linearDeflectionType: 'absolute_value', linearDeflection: 0.002, angularDeflection: 0.5 } : { linearUnit: 'millimeter', linearDeflectionType: 'bounding_box_ratio', linearDeflection: 0.001, angularDeflection: 0.35 });
   return r.meshes.map((m, mi) => {
     const P = m.attributes.position.array, I = m.index.array;
     const soup = (t0, t1) => { const o = []; for (let t = t0; t <= t1; t++) for (let k = 0; k < 3; k++) { const v = I[3 * t + k]; o.push(P[3 * v], P[3 * v + 1], P[3 * v + 2]); } return Float32Array.from(o); };
@@ -193,6 +197,72 @@ console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 $
     if (!ok) failed++;
     console.log(`${ok ? '✔' : '✘'}   ${msg}`);
   }
+}
+
+// ---------- 插入力計算（解析法） ----------
+{
+  console.log('\n[插入力] 壓入配合與懸臂卡扣');
+  const st = MATERIALS.s45c;
+  // 同材料實心軸：p = δE(D²−d²)/(2dD²)
+  const pf = pressFit({ shaft: st, hub: st, d: 20, D: 40, L: 20, delta: 0.02, alpha: 15, mu: 0.15 });
+  const pRef = (0.02 * st.E * (1600 - 400)) / (2 * 20 * 1600);
+  check('壓入配合接觸壓力（Lamé）', pf.p, pRef, 1e-6);
+  check('拔出力 μ·p·πd·L', pf.Fpull, 0.15 * pRef * Math.PI * 20 * 20, 1e-6);
+  check('最大插入力（導角已通過）', pf.Fmax, pf.Fpull, 1e-3);
+  // 塑膠軸套大干涉：依應力-應變曲線的壓力應低於線彈性
+  const pl = pressFit({ shaft: st, hub: MATERIALS.pom, d: 10, D: 16, L: 10, delta: 0.3, alpha: 20, mu: 0.2 });
+  const okPl = pl.p < pl.pLinear * 0.9 && pl.warnings.some((w) => w.includes('降伏'));
+  if (!okPl) failed++;
+  console.log(`${okPl ? '✔' : '✘'}   POM 軸套降伏：p ${pl.p.toFixed(1)} < 線彈性 ${pl.pLinear.toFixed(1)} MPa`);
+  // 卡扣：彈性範圍 P = 3EIy/L³；超過降伏後低於線彈性
+  const pc = MATERIALS.pc;
+  const sf = snapFit({ mat: pc, L: 15, h: 1.5, b: 5, y: 1, alpha: 30, alpha2: 90, mu: 0.3 });
+  const Pref = (3 * pc.E * (5 * 1.5 ** 3) / 12 * 1) / 15 ** 3;
+  check('卡扣撓曲力（彈性）', sf.P, Pref, 2e-3);
+  const t = Math.tan(Math.PI / 6);
+  check('卡扣插入力 P(μ+tanα)/(1−μtanα)', sf.Fin, Pref * (0.3 + t) / (1 - 0.3 * t), 2e-3);
+  const sp = snapFit({ mat: pc, L: 15, h: 1.5, b: 5, y: 5, alpha: 30, alpha2: 90, mu: 0.3 });
+  const okSp = sp.P < sp.Pel * 0.9 && sp.warnings.length > 0;
+  if (!okSp) failed++;
+  console.log(`${okSp ? '✔' : '✘'}   卡扣超過降伏：P ${sp.P.toFixed(2)} < 線彈性 ${sp.Pel.toFixed(2)} N，應變 ${(sp.eps * 100).toFixed(1)}%`);
+}
+
+// ---------- 3D 插入／拔出模擬（TET10、點對面摩擦接觸） ----------
+{
+  console.log('\n[3D 插入／拔出] 鋼銷 Ø10.2 壓入 POM 軸套（內徑 10、外徑 20、長 10，直徑干涉 0.2 mm），μ = 0.15');
+  const ph = loadStep('test/data/pinhub.step', true);
+  const mesh = await meshSeparately(ph, (ps) => tetwildMesh(ps, { size: 2.5 }));
+  const mv = ph[0].bbox[5] > ph[1].bbox[5] ? 0 : 1;
+  const X = mesh.nodes, nNode = X.length / 3, nen = mesh.elems.length / mesh.elemPart.length;
+  const body = new Uint8Array(nNode);
+  for (let e = 0; e < mesh.elemPart.length; e++) if (mesh.elemPart[e] === mv) for (let k = 0; k < nen; k++) body[mesh.elems[e * nen + k]] = 1;
+  const pom = { name: 'pom', E: 2900, nu: 0.37, sy: 65, su: 68, eu: 0.1, ef: 0.4 }, st = { name: 's45c', E: 205000, nu: 0.29, sy: 490, su: 690, eu: 0.12, ef: 0.17 };
+  const mats = mv === 0 ? [st, pom] : [pom, st];
+  const run = (mode) => {
+    const fixed = new Uint8Array(nNode * 3);
+    for (let n = 0; n < nNode; n++) if (!body[n] && X[3 * n + 2] < 0.05) fixed[3 * n] = fixed[3 * n + 1] = fixed[3 * n + 2] = 1; // 軸套底面
+    const zr = mode === 'insert' ? Math.max(...Array.from({ length: nNode }, (_, n) => (body[n] ? X[3 * n + 2] : -Infinity))) : null;
+    const push = [];
+    for (let n = 0; n < nNode; n++) if (body[n] && (mode === 'insert' ? X[3 * n + 2] > zr - 0.05 : X[3 * n + 2] > 15.95)) push.push(n);
+    const S = mode === 'insert' ? 11 : 11;
+    const d0 = mode === 'insert' ? [0, 0, S] : [0, 0, 0], d1 = mode === 'insert' ? [0, 0, 0] : [0, 0, S];
+    const nts = createNTS(mesh, { moving: mv, h: 2.5, E: mats.map((m) => m.E), mu: 0.15 });
+    return solveStatic(mesh, { materials: mats, steps: 8, loadFactor: 1, tol: 1e-6, fixed, F: new Float64Array(nNode * 3), h: 2.5, drive: { push: Int32Array.from(push), body, d0, d1 }, nts });
+  };
+  const ins = run('insert');
+  const fi = ins.steps.map((s) => s.insert);
+  console.log(`    插入：${fi.map((x) => `${x.stroke.toFixed(1)}mm→${x.force.toFixed(0)}N`).join('、')}（${ins.stats.seconds.toFixed(0)} s）`);
+  const mid = fi[Math.floor(fi.length / 2)];
+  check('插入：摩擦力 / (μ·接觸法向力合計)（圓柱段）', mid.force / (0.15 * mid.Fn), 1, 0.15);
+  let okMono = ins.steps.length === 8 && fi.every((x, i) => i < 3 || x.force > fi[i - 1].force);
+  if (!okMono) failed++;
+  console.log(`${okMono ? '✔' : '✘'}   插入：全行程收斂，插入力隨嚙合長度遞增`);
+  const pull = run('pull');
+  const fp = pull.steps.map((s) => s.insert);
+  console.log(`    拔出：${fp.map((x) => `${x.stroke.toFixed(1)}mm→${x.force.toFixed(0)}N`).join('、')}（${pull.stats.seconds.toFixed(0)} s）`);
+  const okPull = pull.steps.length === 8 && fp[0].force > 0 && fp.every((x, i) => !i || x.force <= fp[i - 1].force * 1.02 + 1e-3 * fp[0].force) && Math.abs(fp[fp.length - 1].force) < 0.01 * fp[0].force;
+  if (!okPull) failed++;
+  console.log(`${okPull ? '✔' : '✘'}   拔出：起點最大、隨嚙合長度遞減，完全拔出後為 0`);
 }
 
 console.log(failed ? `\n${failed} 項失敗` : '\n全部通過');

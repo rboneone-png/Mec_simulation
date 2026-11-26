@@ -84,3 +84,24 @@ export async function loadStep(file) {
   });
   return { bytes, parts };
 }
+
+/**
+ * 高精度三角化（插入模擬用）：絕對弦高 0.002 mm，使干涉量（常為 0.01–0.1 mm）不被曲面離散誤差淹沒
+ * 回傳每個實體的 { positions, faceOfTri, bbox }（面編號與一般匯入相同）
+ */
+export async function tessellateFine(bytes) {
+  const occt = await getOcct();
+  const res = occt.ReadStepFile(new Uint8Array(bytes), { linearUnit: 'millimeter', linearDeflectionType: 'absolute_value', linearDeflection: 0.002, angularDeflection: 0.5 });
+  if (!res.success) throw new Error('STEP 高精度三角化失敗');
+  return res.meshes.map((m) => {
+    const P = m.attributes.position.array, I = m.index.array;
+    const positions = new Float32Array(I.length * 3);
+    for (let t = 0; t < I.length; t++) { const v = I[t]; positions[3 * t] = P[3 * v]; positions[3 * t + 1] = P[3 * v + 1]; positions[3 * t + 2] = P[3 * v + 2]; }
+    const faces = m.brep_faces || [];
+    const faceOfTri = new Int32Array(I.length / 3).fill(faces.length);
+    faces.forEach((f, fi) => { for (let t = f.first; t <= f.last; t++) faceOfTri[t] = fi; });
+    const bbox = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < positions.length; i += 3) for (let d = 0; d < 3; d++) { bbox[d] = Math.min(bbox[d], positions[i + d]); bbox[3 + d] = Math.max(bbox[3 + d], positions[i + d]); }
+    return { positions, faceOfTri, bbox };
+  });
+}

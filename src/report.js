@@ -22,7 +22,7 @@ class Doc {
     // 頁首
     g.fillStyle = C.head; g.fillRect(0, 0, W, 8);
     g.font = `500 17px ${FONT}`; g.fillStyle = C.dim; g.textBaseline = 'alphabetic';
-    g.textAlign = 'left'; g.fillText(`MecSim 結構分析報告｜${this.meta.name}`, M, 46);
+    g.textAlign = 'left'; g.fillText(`MecSim ${this.meta.title || '結構分析報告'}｜${this.meta.name}`, M, 46);
     g.textAlign = 'right'; g.fillText(this.meta.date, W - M, 46);
     g.textAlign = 'left';
     g.strokeStyle = C.line; g.lineWidth = 1; g.beginPath(); g.moveTo(M, 60); g.lineTo(W - M, 60); g.stroke();
@@ -212,19 +212,55 @@ export async function buildReportPdf(data) {
   doc.y += 10;
   doc.text('說明：本報告由 MecSim 於瀏覽器端計算產生（小應變有限元素分析）。尖角與拘束邊緣的應力可能為數值奇異點；材料數值為典型值，正式設計請依實際材料規格與相關規範驗證。', { size: 15, color: C.dim });
 
+  return finish(doc, `${data.name} 結構分析報告`);
+}
+
+
+async function finish(doc, title) {
   // 頁碼
   doc.pages.forEach((cv, i) => {
     const pg = cv.getContext('2d');
     pg.font = `400 15px ${FONT}`; pg.fillStyle = C.dim; pg.textAlign = 'center';
     pg.fillText(`${i + 1} / ${doc.pages.length}`, W / 2, H - 40);
   });
-
   const { jsPDF } = await import('jspdf');
   const pdf = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
-  pdf.setProperties({ title: `${data.name} 結構分析報告`, creator: 'MecSim' });
+  pdf.setProperties({ title, creator: 'MecSim' });
   doc.pages.forEach((cv, i) => {
     if (i) pdf.addPage();
     pdf.addImage(cv.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
   });
   return { blob: pdf.output('blob'), pages: doc.pages.length };
+}
+
+/** 插入力計算報告 */
+export async function buildInsertionPdf(data) {
+  const doc = new Doc({ name: data.name, date: data.date, title: '插入力計算報告' });
+  const g = doc.g;
+  g.font = `700 44px ${FONT}`; g.fillStyle = C.head; g.fillText(data.name, M, doc.y + 44);
+  doc.y += 70;
+  doc.text(`插入力計算報告｜${data.kind}｜產出時間 ${data.date}`, { size: 19, color: C.dim, gap: 20 });
+
+  doc.heading('1. 輸入條件');
+  doc.kv(data.inputs);
+
+  doc.heading('2. 計算結果');
+  doc.kv(data.kpis.map(([k, v, u]) => [k, `${v} ${u}`]));
+  doc.table([{ label: '項目', w: 2 }, { label: '數值', w: 2, align: 'right' }], data.rows);
+  if (data.warnings.length) {
+    doc.text('警告：', { size: 18, weight: 600, color: C.bad, gap: 2 });
+    for (const w of data.warnings) doc.text(`• ${w}`, { size: 16, color: C.bad, gap: 2, indent: 12 });
+  } else doc.text('未發現降伏、斷裂或自鎖問題。', { size: 16, color: C.ok });
+
+  doc.ensure(560);
+  doc.heading('3. 圖表');
+  if (data.images.force) doc.image(data.images.force, '圖 1　插入力-行程曲線（虛線：線彈性對照）', null, 1);
+  if (data.images.sketch) doc.image(data.images.sketch, '圖 2　示意圖', null, 0.62);
+  data.images.ss.forEach((im, i) => im && doc.image(im, `圖 ${3 + i}　應力-應變曲線與工作點：${data.ss[i].title}`, null, 0.62));
+
+  doc.heading('4. 計算方法與假設');
+  doc.text(data.method, { size: 16, color: C.text });
+  doc.y += 6;
+  doc.text('說明：本報告由 MecSim 以解析法於瀏覽器端計算產生；材料數值為典型值，摩擦係數受表面狀態、潤滑與速度影響甚大，正式設計請以實測或供應商資料驗證。', { size: 15, color: C.dim });
+  return finish(doc, `${data.name} 插入力計算報告`);
 }
