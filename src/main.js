@@ -7,6 +7,7 @@ import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots
 const $ = (id) => document.getElementById(id);
 const BC_LABEL = { fixed: '固定約束', force: '力', pressure: '壓力' };
 const BC_COLOR = { fixed: new THREE.Color('#2f7bff'), force: new THREE.Color('#ff5a4f'), pressure: new THREE.Color('#ff8a3d') };
+const MESH_NAME = { hex20: 'HEX20 貼體六面體（二次）', hex8: 'HEX8 貼體六面體', tet: 'TET10 四面體', voxel: 'HEX8 體素', tet10: 'TET10 四面體' };
 const RES_LABEL = { vm: 'von Mises 應力 [MPa]', umag: '總位移 [mm]', ux: '位移 Ux [mm]', uy: '位移 Uy [mm]', uz: '位移 Uz [mm]', pe: '等效塑性應變 PEEQ' };
 
 const state = {
@@ -20,11 +21,14 @@ const state = {
   step: 0,
   mode: 'model',
   resultType: 'vm',
+  secAxis: 0,
+  anim: { playing: false, t0: 0, lastStepT: 0 },
   showDeform: true,
   deformScale: 1,
 };
 let bcSeq = 0;
 const viewer = new Viewer($('canvasHost'));
+viewer.setColormap(colormap, 12);
 
 // ---------- Worker ----------
 class FeaClient {
@@ -178,27 +182,15 @@ function repaint() {
   viewer.clearOverlay();
   viewer.showResult(resultMode);
   const range = resultMode ? resultRange() : null;
+  state.range = range;
   const scale = resultMode && state.showDeform ? state.deformScale : 0;
-  const tmp = [0, 0, 0];
 
   if (resultMode) {
-    const s = curStep(), used = state.results.used;
-    for (const rm of state.mesh.resultMeshes) {
-      const part = partById(rm.partId);
-      rm.mesh.visible = !!part?.visible;
-      const g = rm.mesh.geometry, col = g.attributes.color, pos = g.attributes.position;
-      const vn = rm.vertexNode, P = rm.positions;
-      for (let v = 0; v < vn.length; v++) {
-        const n = vn[v];
-        if (n < 0 || !used[n]) { col.setXYZ(v, 0.35, 0.35, 0.35); pos.setXYZ(v, P[3 * v], P[3 * v + 1], P[3 * v + 2]); continue; }
-        colormap((valueAt(n) - range[0]) / (range[1] - range[0]), tmp);
-        col.setXYZ(v, tmp[0] ** 2.2, tmp[1] ** 2.2, tmp[2] ** 2.2);
-        pos.setXYZ(v, P[3 * v] + scale * s.u[3 * n], P[3 * v + 1] + scale * s.u[3 * n + 1], P[3 * v + 2] + scale * s.u[3 * n + 2]);
-      }
-      col.needsUpdate = pos.needsUpdate = true;
-      g.computeVertexNormals();
-      g.computeBoundingSphere();
-    }
+    for (const rm of state.mesh.resultMeshes) rm.mesh.visible = !!partById(rm.partId)?.visible;
+    updateResultColors(range);
+    buildSection(range);
+    updateLabels();
+    updateDeformation(scale);
   } else {
     for (const p of state.parts) {
       const col = p.geometry.attributes.color;
@@ -218,10 +210,61 @@ function repaint() {
       viewer.setPartVisible(p.id, p.visible, 1);
     }
     drawBcGlyphs();
+    viewer.setClip(null);
+    viewer.setSection(null);
+    viewer.setLabels(null);
+    state.section = null;
+    updateWire(0);
   }
   viewer.setEdgesVisible($('showEdges').checked);
-  updateWire(scale);
   updateLegend(range);
+}
+
+/** 數值 → 色帶貼圖 u 座標（逐像素上色，分段等值線清晰） */
+function texU(n, range) {
+  if (n < 0 || !state.results.used[n]) return Viewer.texU(-1);
+  return Viewer.texU((valueAt(n) - range[0]) / (range[1] - range[0]));
+}
+
+function updateResultColors(range) {
+  for (const rm of state.mesh.resultMeshes) {
+    const uv = rm.mesh.geometry.attributes.uv, vn = rm.vertexNode;
+    for (let v = 0; v < vn.length; v++) uv.setX(v, texU(vn[v], range));
+    uv.needsUpdate = true;
+  }
+}
+
+/** 依變形倍率更新所有結果幾何（動畫每格呼叫） */
+function updateDeformation(scale) {
+  const s = curStep(), u = s.u, used = state.results.used;
+  for (const rm of state.mesh.resultMeshes) {
+    if (!rm.mesh.visible) continue;
+    const g = rm.mesh.geometry, pos = g.attributes.position, vn = rm.vertexNode, P = rm.positions;
+    for (let v = 0; v < vn.length; v++) {
+      const n = vn[v];
+      if (n < 0 || !used[n]) { pos.setXYZ(v, P[3 * v], P[3 * v + 1], P[3 * v + 2]); continue; }
+      pos.setXYZ(v, P[3 * v] + scale * u[3 * n], P[3 * v + 1] + scale * u[3 * n + 1], P[3 * v + 2] + scale * u[3 * n + 2]);
+    }
+    pos.needsUpdate = true;
+    g.computeVertexNormals();
+    g.computeBoundingSphere();
+  }
+  const N = state.mesh.nodes;
+  const at = (n, d) => N[3 * n + d] + scale * u[3 * n + d];
+  // 剖面
+  const sec = state.section;
+  if (sec && viewer.section) {
+    const pos = viewer.section.geometry.attributes.position;
+    for (let v = 0; v < sec.pa.length; v++) {
+      const a = sec.pa[v], b = sec.pb[v], t = sec.pt[v];
+      pos.setXYZ(v, at(a, 0) + t * (at(b, 0) - at(a, 0)), at(a, 1) + t * (at(b, 1) - at(a, 1)), at(a, 2) + t * (at(b, 2) - at(a, 2)));
+    }
+    pos.needsUpdate = true;
+    viewer.section.geometry.computeBoundingSphere();
+  }
+  // 標籤
+  if (state.labelNodes) viewer.moveLabels(state.labelNodes.map((n) => [at(n, 0), at(n, 1), at(n, 2)]));
+  updateWire(scale);
 }
 
 function updateWire(scale) {
@@ -235,6 +278,100 @@ function updateWire(scale) {
     for (let d = 0; d < 3; d++) out[3 * i + d] = N[3 * n + d] + (u ? scale * u[3 * n + d] : 0);
   }
   viewer.setWire(out);
+}
+
+// ---------- 剖面 ----------
+const CUT_EDGES = {
+  hex: [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]],
+  tet: [[0, 1], [1, 2], [0, 2], [0, 3], [2, 3], [1, 3]],
+};
+
+function modelBounds() {
+  const N = state.mesh.nodes, used = state.results.used;
+  const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+  for (let n = 0; n < used.length; n++) if (used[n]) for (let d = 0; d < 3; d++) { b[d] = Math.min(b[d], N[3 * n + d]); b[3 + d] = Math.max(b[3 + d], N[3 * n + d]); }
+  return b;
+}
+
+function buildSection(range) {
+  state.section = null;
+  state.clip = null;
+  if (!$('secOn').checked) { viewer.setClip(null); viewer.setSection(null); return; }
+  const m = state.mesh, N = m.nodes, used = state.results.used;
+  const axis = state.secAxis, b = modelBounds();
+  // 微小偏移：避免剖面剛好通過節點平面造成剖切面缺漏
+  const c = b[axis] + ((b[3 + axis] - b[axis]) * (+$('secPos').value + 1.234e-3)) / 1000;
+  // 預設保留離相機較遠的一側，使剖切面朝向觀察者；「反向」可切換
+  const camSide = viewer.camera.position.getComponent(axis) < c;
+  const flip = camSide !== $('secFlip').checked;
+  $('secVal').textContent = `${'XYZ'[axis]} = ${fmt(c, 4)} mm`;
+  const normal = [0, 0, 0];
+  normal[axis] = flip ? 1 : -1;
+  viewer.setClip({ normal, constant: flip ? -c : c });
+  state.clip = { axis, c, keepGreater: flip };
+
+  const nen = m.elems.length / m.elemPart.length;
+  const isTet = m.type === 'tet10';
+  const nc = isTet ? 4 : 8, edges = CUT_EDGES[isTet ? 'tet' : 'hex'];
+  const visible = state.parts.map((p) => p.visible);
+  const pa = [], pb = [], pt = [];
+  const a1 = (axis + 1) % 3, a2 = (axis + 2) % 3;
+  const dist = new Float64Array(8);
+  for (let e = 0; e < m.elemPart.length; e++) {
+    if (!visible[m.elemPart[e]]) continue;
+    const o = e * nen;
+    if (!used[m.elems[o]]) continue;
+    let pos = 0, neg = 0;
+    for (let k = 0; k < nc; k++) { dist[k] = N[3 * m.elems[o + k] + axis] - c; if (dist[k] > 0) pos++; else neg++; }
+    if (!pos || !neg) continue;
+    const pts = [];
+    for (const [i, j] of edges) {
+      if ((dist[i] > 0) === (dist[j] > 0)) continue;
+      const t = dist[i] / (dist[i] - dist[j]);
+      const na = m.elems[o + i], nb = m.elems[o + j];
+      pts.push({ na, nb, t, x: N[3 * na + a1] + t * (N[3 * nb + a1] - N[3 * na + a1]), y: N[3 * na + a2] + t * (N[3 * nb + a2] - N[3 * na + a2]) });
+    }
+    if (pts.length < 3) continue;
+    const cx = pts.reduce((s2, p) => s2 + p.x, 0) / pts.length, cy = pts.reduce((s2, p) => s2 + p.y, 0) / pts.length;
+    pts.sort((p, q) => Math.atan2(p.y - cy, p.x - cx) - Math.atan2(q.y - cy, q.x - cx));
+    for (let k = 1; k + 1 < pts.length; k++)
+      for (const p of [pts[0], pts[k], pts[k + 1]]) { pa.push(p.na); pb.push(p.nb); pt.push(p.t); }
+  }
+  const sec = { pa: Int32Array.from(pa), pb: Int32Array.from(pb), pt: Float32Array.from(pt) };
+  const uv = new Float32Array(sec.pa.length * 2);
+  for (let v = 0; v < sec.pa.length; v++) {
+    const va = valueAt(sec.pa[v]), vb = valueAt(sec.pb[v]);
+    uv[2 * v] = Viewer.texU((va + sec.pt[v] * (vb - va) - range[0]) / (range[1] - range[0]));
+    uv[2 * v + 1] = 0.5;
+  }
+  state.section = sec;
+  viewer.setSection(new Float32Array(sec.pa.length * 3), uv);
+}
+
+// ---------- 最大／最小標示 ----------
+function updateLabels() {
+  state.labelNodes = null;
+  if (!$('showMinMax').checked) { viewer.setLabels(null); return; }
+  const used = state.results.used;
+  let nMax = -1, nMin = -1, vMax = -Infinity, vMin = Infinity;
+  for (const rm of state.mesh.resultMeshes) {
+    if (!rm.mesh.visible) continue;
+    for (const n of rm.vertexNode) {
+      if (n < 0 || !used[n]) continue;
+      if (state.clip) { const x = state.mesh.nodes[3 * n + state.clip.axis]; if (state.clip.keepGreater ? x < state.clip.c : x > state.clip.c) continue; }
+      const v = valueAt(n);
+      if (v > vMax) { vMax = v; nMax = n; }
+      if (v < vMin) { vMin = v; nMin = n; }
+    }
+  }
+  if (nMax < 0) { viewer.setLabels(null); return; }
+  const unit = { vm: ' MPa', pe: '', umag: ' mm', ux: ' mm', uy: ' mm', uz: ' mm' }[state.resultType];
+  const N = state.mesh.nodes, P = (n) => [N[3 * n], N[3 * n + 1], N[3 * n + 2]];
+  viewer.setLabels([
+    { pos: P(nMax), text: `MAX ${fmt(vMax, 4)}${unit}`, color: '#ff4d4d' },
+    { pos: P(nMin), text: `MIN ${fmt(vMin, 4)}${unit}`, color: '#3d7bff' },
+  ]);
+  state.labelNodes = [nMax, nMax, nMin, nMin]; // sprite 與圓點各一
 }
 
 function drawBcGlyphs() {
@@ -255,7 +392,7 @@ function updateLegend(range) {
   $('legend').hidden = !range;
   if (!range) return;
   $('legendTitle').textContent = RES_LABEL[state.resultType] + (state.results.steps.length > 1 ? `｜λ=${fmt(curStep().lambda)}` : '');
-  $('legendBar').style.background = colormapCss();
+  $('legendBar').style.background = colormapCss(12, +$('bands').value);
   const ticks = [];
   for (let i = 0; i <= 10; i++) ticks.push(`<div>${fmt(range[1] - ((range[1] - range[0]) * i) / 10)}</div>`);
   $('legendTicks').innerHTML = ticks.join('');
@@ -387,7 +524,7 @@ function renderMeshInfo() {
   const m = state.mesh;
   $('meshSize').placeholder = `自動 ≈ ${fmt(autoMeshSize(), 2)}`;
   if (!m) { $('meshInfo').textContent = state.parts.length ? '尚未產生網格（執行模擬時會自動產生）' : '尚未產生網格'; return; }
-  $('meshInfo').innerHTML = `<b>${m.type === 'tet10' ? 'TET10 二次四面體' : 'HEX8 體素'}</b>・元素 <b>${m.elemCount.toLocaleString()}</b>・節點 <b>${m.nodeCount.toLocaleString()}</b>・尺寸 ${fmt(m.size)} mm・${m.seconds.toFixed(1)} s`;
+  $('meshInfo').innerHTML = `<b>${MESH_NAME[m.type]}</b>・元素 <b>${m.elemCount.toLocaleString()}</b>・節點 <b>${m.nodeCount.toLocaleString()}</b>・尺寸 ${fmt(m.size)} mm・${m.seconds.toFixed(1)} s`;
 }
 
 function renderResults() {
@@ -421,7 +558,7 @@ function renderResults() {
   });
   const st = r.stats;
   html += `<tr><td colspan="4" style="color:var(--text-dim);font-size:11px;padding-top:8px">
-    ${st.type === 'tet10' ? 'TET10' : 'HEX8'}・元素 ${st.elements.toLocaleString()}・自由度 ${st.dofs.toLocaleString()}<br>
+    ${st.type.toUpperCase()}・元素 ${st.elements.toLocaleString()}・自由度 ${st.dofs.toLocaleString()}<br>
     ${plastic ? `負載步 ${r.steps.length}・Newton ${st.newton} 次・` : ''}PCG ${st.cg.toLocaleString()} 次・${st.seconds.toFixed(1)} s<br>
     總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N</td></tr>`;
   $('statsTable').innerHTML = html;
@@ -436,6 +573,8 @@ function renderResults() {
 function renderAll() {
   const plasticUI = $('anaType').value === 'plastic';
   document.body.classList.toggle('plastic', plasticUI);
+  $('animType').querySelector('[value=steps]').disabled = !(hasResults() && state.results.steps.length > 1);
+  if ($('animType').querySelector('[value=steps]').disabled && $('animType').value === 'steps') $('animType').value = 'deform';
   const peOpt = $('resType').querySelector('[value=pe]');
   peOpt.disabled = !(hasResults() && state.results.stats.plastic);
   if (peOpt.disabled && state.resultType === 'pe') { state.resultType = 'vm'; $('resType').value = 'vm'; }
@@ -449,6 +588,7 @@ function renderAll() {
 
 function setMode(mode) {
   if (mode === 'result' && !hasResults()) mode = 'model';
+  if (mode !== 'result' && state.anim?.playing) { state.anim.playing = false; $('btnPlay').textContent = '▶ 播放'; }
   state.mode = mode;
   if (mode === 'result') state.activeBcId = null;
   for (const b of $('modeSeg').querySelectorAll('button')) b.classList.toggle('on', b.dataset.mode === mode);
@@ -505,7 +645,8 @@ function autoMeshSize() {
   const b = viewer.bounds();
   if (b.isEmpty()) return 5;
   const s = b.getSize(new THREE.Vector3());
-  return $('meshMethod').value === 'tet' ? s.length() / 30 : Math.max(s.x, s.y, s.z) / 48;
+  const m = $('meshMethod').value;
+  return m === 'hex8' ? s.length() / 60 : s.length() / 30;
 }
 
 function showProgress(on) {
@@ -527,7 +668,7 @@ async function generateMesh() {
     method, size,
     parts: state.parts.map((p) => ({ name: p.name, bbox: p.bbox, positions: p.basePositions, faceOfTri: p.faceOfTri })),
   };
-  log(`產生網格（${method === 'tet' ? 'TET10' : 'HEX8'}，尺寸 ${fmt(size)} mm）…`);
+  log(`產生網格（${MESH_NAME[method]}，尺寸 ${fmt(size)} mm）…`);
   const res = await fea.call('mesh', data, onProgress);
   const wire = [];
   res.display.forEach((d) => { if (d.wire) for (const n of d.wire) wire.push(n); });
@@ -537,7 +678,8 @@ async function generateMesh() {
   state.results = null;
   for (const w of res.warnings) log(w, 'w');
   log(`網格完成：${res.elemCount.toLocaleString()} 元素、${res.nodeCount.toLocaleString()} 節點（${res.seconds.toFixed(1)} s）`);
-  if (method === 'tet' && !$('showMesh').checked) $('showMesh').checked = true;
+  if (!$('showMesh').checked) $('showMesh').checked = true;
+  if (res.quality !== undefined) log(`網格品質：最小縮放 Jacobian ${res.quality.toFixed(2)}（1 = 理想立方體）`);
 }
 
 async function meshOnly() {
@@ -708,6 +850,89 @@ $('splitter').onpointerdown = (e) => {
   window.addEventListener('pointerup', up);
   e.preventDefault();
 };
+
+// ---------- 動態展示 ----------
+function animPeriod() {
+  const sp = +$('animSpeed').value || 1;
+  return $('animType').value === 'steps' ? (Math.max(2, state.results.steps.length) * 0.5) / sp : 2 / sp;
+}
+
+function setPlaying(on) {
+  const A = state.anim;
+  if (on && !hasResults()) return;
+  if (on && state.mode !== 'result') { setMode('result'); renderAll(); }
+  A.playing = on;
+  A.t0 = performance.now();
+  A.lastStepT = A.t0;
+  $('btnPlay').textContent = on ? '❚❚ 暫停' : '▶ 播放';
+  if (!on) repaint(); // 回到靜態顯示
+}
+
+viewer.onFrame = () => {
+  const A = state.anim;
+  if (!A.playing || !hasResults() || state.mode !== 'result') return;
+  const now = performance.now();
+  const type = $('animType').value;
+  const sp = +$('animSpeed').value || 1;
+  if (type === 'steps') {
+    if (now - A.lastStepT < 500 / sp) return;
+    A.lastStepT = now;
+    state.step = (state.step + 1) % state.results.steps.length;
+    renderResults();
+    renderMaterial();
+    repaint();
+    return;
+  }
+  const ph = ((now - A.t0) / 1000 / animPeriod()) % 1;
+  const f = type === 'deform' ? (1 - Math.cos(2 * Math.PI * ph)) / 2 : ph;
+  updateDeformation(state.deformScale * f);
+};
+
+async function recordWebM() {
+  if (!hasResults()) return;
+  if (typeof MediaRecorder === 'undefined') return alert('此瀏覽器不支援錄影（MediaRecorder）');
+  const canvas = viewer.renderer.domElement;
+  const stream = canvas.captureStream(30);
+  const mime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m));
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8e6 } : undefined);
+  const chunks = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const done = new Promise((r) => (rec.onstop = r));
+  const wasPlaying = state.anim.playing;
+  if ($('animType').value === 'steps') state.step = state.results.steps.length - 1;
+  setPlaying(true);
+  $('btnRec').classList.add('rec');
+  $('btnRec').textContent = '● 錄製中…';
+  rec.start();
+  await new Promise((r) => setTimeout(r, animPeriod() * 1000 * ($('animType').value === 'deform1' ? 2 : 1) + 100));
+  rec.stop();
+  await done;
+  if (!wasPlaying) setPlaying(false);
+  $('btnRec').classList.remove('rec');
+  $('btnRec').textContent = '● 錄製 WebM';
+  download('mecsim_animation.webm', new Blob(chunks, { type: 'video/webm' }));
+  log('已輸出動畫 mecsim_animation.webm');
+}
+
+$('btnPlay').onclick = () => setPlaying(!state.anim.playing);
+$('btnRec').onclick = recordWebM;
+$('animSpeed').oninput = () => { $('animSpeedVal').textContent = `${$('animSpeed').value}×`; };
+$('animType').onchange = () => { if (state.anim.playing) setPlaying(true); };
+$('animSpeedVal').textContent = '1×';
+
+// ---------- 顯示選項 ----------
+$('bands').onchange = () => { viewer.setColormap(colormap, +$('bands').value); repaint(); };
+$('showMinMax').onchange = repaint;
+$('secOn').onchange = repaint;
+$('secPos').oninput = repaint;
+$('secFlip').onchange = repaint;
+for (const b of $('secAxis').querySelectorAll('button'))
+  b.onclick = () => {
+    state.secAxis = +b.dataset.axis;
+    for (const x of $('secAxis').querySelectorAll('button')) x.classList.toggle('on', x === b);
+    repaint();
+  };
+$('hiQ').onchange = () => viewer.setHighQuality($('hiQ').checked);
 
 renderAll();
 

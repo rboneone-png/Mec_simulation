@@ -10,6 +10,25 @@ const HEX_SIGN = [
 export const TET10_EDGES = [[0, 1], [1, 2], [0, 2], [0, 3], [2, 3], [1, 3]];
 const TA = 0.5854101966249685, TB = 0.1381966011250105;
 
+// HEX20（serendipity）：0-7 角點（同 HEX8），8-19 邊中點
+export const HEX20_EDGES = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+const HEX20_NAT = [...HEX_SIGN, ...HEX20_EDGES.map(([a, b]) => HEX_SIGN[a].map((v, d) => (v + HEX_SIGN[b][d]) / 2))];
+export { HEX_SIGN };
+
+function hex8Extrapolate(gv, out) {
+  const s = Math.sqrt(3);
+  for (let n = 0; n < 8; n++) {
+    const [nx, ny, nz] = HEX_SIGN[n];
+    let v = 0;
+    for (let k = 0; k < 8; k++) {
+      const [kx, ky, kz] = HEX_SIGN[k];
+      v += ((1 + kx * nx * s) * (1 + ky * ny * s) * (1 + kz * nz * s)) / 8 * gv[k];
+    }
+    out[n] = v;
+  }
+  return out;
+}
+
 export const ELEMENTS = {
   hex8: {
     nen: 8,
@@ -38,6 +57,41 @@ export const ELEMENTS = {
         }
         out[n] = v;
       }
+      return out;
+    },
+  },
+  // 二次六面體，2×2×2 縮減積分（同 C3D20R）
+  hex20: {
+    nen: 20,
+    gauss: HEX_SIGN.map(([a, b, c]) => [a * G, b * G, c * G]),
+    weights: new Array(8).fill(1),
+    dN(xi, out) {
+      const [x, y, z] = xi;
+      for (let n = 0; n < 20; n++) {
+        const [a, b, c] = HEX20_NAT[n];
+        if (n < 8) {
+          out[3 * n] = (a * (1 + b * y) * (1 + c * z) * (2 * a * x + b * y + c * z - 1)) / 8;
+          out[3 * n + 1] = (b * (1 + a * x) * (1 + c * z) * (a * x + 2 * b * y + c * z - 1)) / 8;
+          out[3 * n + 2] = (c * (1 + a * x) * (1 + b * y) * (a * x + b * y + 2 * c * z - 1)) / 8;
+        } else if (a === 0) {
+          out[3 * n] = (-x * (1 + b * y) * (1 + c * z)) / 2;
+          out[3 * n + 1] = ((1 - x * x) * b * (1 + c * z)) / 4;
+          out[3 * n + 2] = ((1 - x * x) * (1 + b * y) * c) / 4;
+        } else if (b === 0) {
+          out[3 * n] = ((1 - y * y) * a * (1 + c * z)) / 4;
+          out[3 * n + 1] = (-y * (1 + a * x) * (1 + c * z)) / 2;
+          out[3 * n + 2] = ((1 - y * y) * (1 + a * x) * c) / 4;
+        } else {
+          out[3 * n] = ((1 - z * z) * a * (1 + b * y)) / 4;
+          out[3 * n + 1] = ((1 - z * z) * (1 + a * x) * b) / 4;
+          out[3 * n + 2] = (-z * (1 + a * x) * (1 + b * y)) / 2;
+        }
+      }
+      return out;
+    },
+    extrapolate(gv, out) {
+      hex8Extrapolate(gv, out);
+      HEX20_EDGES.forEach(([a, b], k) => (out[8 + k] = (out[a] + out[b]) / 2));
       return out;
     },
   },

@@ -1,6 +1,7 @@
 // 常駐 Worker：保留網格於記憶體，處理「產生網格」與「求解」
 import { voxelMesh } from './fea/mesh-voxel.js';
 import { tetwildMesh } from './fea/mesh-tetwild.js';
+import { hexMesh } from './fea/mesh-hex.js';
 import { buildLoads } from './fea/bc.js';
 import { solveStatic } from './fea/solver.js';
 
@@ -15,12 +16,9 @@ self.onmessage = async (e) => {
     if (cmd === 'mesh') {
       const t0 = Date.now();
       mesh = null;
-      if (data.method === 'tet') {
-        mesh = await tetwildMesh(data.parts, { size: data.size }, progress);
-      } else {
-        progress({ stage: '體素化', frac: 0.2 });
-        mesh = voxelMesh(data.parts, data.size);
-      }
+      if (data.method === 'tet') mesh = await tetwildMesh(data.parts, { size: data.size }, progress);
+      else if (data.method === 'hex20' || data.method === 'hex8') mesh = hexMesh(data.parts, { size: data.size, order: data.method === 'hex20' ? 2 : 1 }, progress);
+      else { progress({ stage: '體素化', frac: 0.2 }); mesh = voxelMesh(data.parts, data.size); }
       if (!mesh.elems.length) throw new Error('網格沒有任何元素（元素尺寸可能大於零件厚度）');
       const counts = new Array(data.parts.length).fill(0);
       for (const p of mesh.elemPart) counts[p]++;
@@ -30,6 +28,9 @@ self.onmessage = async (e) => {
         nodeCount: mesh.nodes.length / 3,
         elemCount: mesh.elemPart.length,
         partElems: counts,
+        elems: mesh.elems,
+        elemPart: mesh.elemPart,
+        quality: mesh.info?.worstQuality,
         display: mesh.display,
         warnings: mesh.warnings,
         seconds: (Date.now() - t0) / 1000,

@@ -20,7 +20,15 @@ export function colormap(t, out = [0, 0, 0]) {
   return out;
 }
 
-export function colormapCss(n = 12) {
+export function colormapCss(n = 12, bands = 0) {
+  if (bands > 0) {
+    const parts = [];
+    for (let i = 0; i < bands; i++) {
+      const c = colormap(1 - i / Math.max(1, bands - 1)).map((v) => Math.round(v * 255));
+      parts.push(`rgb(${c}) ${(i / bands) * 100}%`, `rgb(${c}) ${((i + 1) / bands) * 100}%`);
+    }
+    return `linear-gradient(to bottom, ${parts.join(',')})`;
+  }
   const parts = [];
   for (let i = 0; i <= n; i++) {
     const c = colormap(1 - i / n).map((v) => Math.round(v * 255));
