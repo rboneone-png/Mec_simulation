@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { Viewer } from './viewer.js';
 import { loadStep } from './importers.js';
-import { MATERIALS, cloneMaterial } from './materials.js';
+import { MATERIALS, CATEGORIES, cloneMaterial } from './materials.js';
+import { CONTACT_TYPES } from './fea/contact.js';
 import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots.js';
 
 const $ = (id) => document.getElementById(id);
@@ -22,6 +23,8 @@ const state = {
   mode: 'model',
   resultType: 'vm',
   secAxis: 0,
+  matCat: 'all',
+  contacts: {}, // 'idA-idB' → 結合方式
   anim: { playing: false, t0: 0, lastStepT: 0 },
   showDeform: true,
   deformScale: 1,
@@ -97,6 +100,9 @@ const partById = (id) => state.parts.find((p) => p.id === id);
 const partIndex = (id) => state.parts.findIndex((p) => p.id === id);
 const modelSize = () => { const b = viewer.bounds(); return b.isEmpty() ? 100 : b.getSize(new THREE.Vector3()).length(); };
 const hasResults = () => state.results && !state.results.stale;
+/** 結果使用的節點／元素（接觸設定可能拆開介面節點） */
+const RV = () => state.results.view;
+const vnOf = (rm) => (hasResults() ? RV().vn.get(rm.partId) : rm.vertexNode);
 const curStep = () => state.results.steps[state.step];
 
 // ---------- 模型管理 ----------
@@ -117,7 +123,7 @@ function addFile(name, bytes, parts) {
 
 function clearAll() {
   fea.reset(new Error('已清除'));
-  Object.assign(state, { files: [], parts: [], bcs: [], activeBcId: null, selectedPartId: null, results: null });
+  Object.assign(state, { files: [], parts: [], bcs: [], activeBcId: null, selectedPartId: null, results: null, contacts: {} });
   viewer.setParts([]);
   setMode('model');
   renderAll();
@@ -228,7 +234,7 @@ function texU(n, range) {
 
 function updateResultColors(range) {
   for (const rm of state.mesh.resultMeshes) {
-    const uv = rm.mesh.geometry.attributes.uv, vn = rm.vertexNode;
+    const uv = rm.mesh.geometry.attributes.uv, vn = vnOf(rm);
     for (let v = 0; v < vn.length; v++) uv.setX(v, texU(vn[v], range));
     uv.needsUpdate = true;
   }
@@ -239,7 +245,7 @@ function updateDeformation(scale) {
   const s = curStep(), u = s.u, used = state.results.used;
   for (const rm of state.mesh.resultMeshes) {
     if (!rm.mesh.visible) continue;
-    const g = rm.mesh.geometry, pos = g.attributes.position, vn = rm.vertexNode, P = rm.positions;
+    const g = rm.mesh.geometry, pos = g.attributes.position, vn = vnOf(rm), P = rm.positions;
     for (let v = 0; v < vn.length; v++) {
       const n = vn[v];
       if (n < 0 || !used[n]) { pos.setXYZ(v, P[3 * v], P[3 * v + 1], P[3 * v + 2]); continue; }
@@ -249,7 +255,7 @@ function updateDeformation(scale) {
     g.computeVertexNormals();
     g.computeBoundingSphere();
   }
-  const N = state.mesh.nodes;
+  const N = RV().nodes;
   const at = (n, d) => N[3 * n + d] + scale * u[3 * n + d];
   // 剖面
   const sec = state.section;
@@ -270,7 +276,8 @@ function updateDeformation(scale) {
 function updateWire(scale) {
   const m = state.mesh;
   if (!$('showMesh').checked || !m || !m.wireNodes) { viewer.setWire(null); return; }
-  const W = m.wireNodes, N = m.nodes;
+  const inRes = state.mode === 'result' && hasResults();
+  const W = inRes ? RV().wire : m.wireNodes, N = inRes ? RV().nodes : m.nodes;
   const u = scale && hasResults() ? curStep().u : null;
   const out = new Float32Array(W.length * 3);
   for (let i = 0; i < W.length; i++) {
@@ -287,7 +294,7 @@ const CUT_EDGES = {
 };
 
 function modelBounds() {
-  const N = state.mesh.nodes, used = state.results.used;
+  const N = RV().nodes, used = state.results.used;
   const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
   for (let n = 0; n < used.length; n++) if (used[n]) for (let d = 0; d < 3; d++) { b[d] = Math.min(b[d], N[3 * n + d]); b[3 + d] = Math.max(b[3 + d], N[3 * n + d]); }
   return b;
@@ -297,7 +304,7 @@ function buildSection(range) {
   state.section = null;
   state.clip = null;
   if (!$('secOn').checked) { viewer.setClip(null); viewer.setSection(null); return; }
-  const m = state.mesh, N = m.nodes, used = state.results.used;
+  const m = { ...state.mesh, nodes: RV().nodes, elems: RV().elems }, N = m.nodes, used = state.results.used;
   const axis = state.secAxis, b = modelBounds();
   // 微小偏移：避免剖面剛好通過節點平面造成剖切面缺漏
   const c = b[axis] + ((b[3 + axis] - b[axis]) * (+$('secPos').value + 1.234e-3)) / 1000;
@@ -356,9 +363,9 @@ function updateLabels() {
   let nMax = -1, nMin = -1, vMax = -Infinity, vMin = Infinity;
   for (const rm of state.mesh.resultMeshes) {
     if (!rm.mesh.visible) continue;
-    for (const n of rm.vertexNode) {
+    for (const n of vnOf(rm)) {
       if (n < 0 || !used[n]) continue;
-      if (state.clip) { const x = state.mesh.nodes[3 * n + state.clip.axis]; if (state.clip.keepGreater ? x < state.clip.c : x > state.clip.c) continue; }
+      if (state.clip) { const x = RV().nodes[3 * n + state.clip.axis]; if (state.clip.keepGreater ? x < state.clip.c : x > state.clip.c) continue; }
       const v = valueAt(n);
       if (v > vMax) { vMax = v; nMax = n; }
       if (v < vMin) { vMin = v; nMin = n; }
@@ -366,7 +373,7 @@ function updateLabels() {
   }
   if (nMax < 0) { viewer.setLabels(null); return; }
   const unit = { vm: ' MPa', pe: '', umag: ' mm', ux: ' mm', uy: ' mm', uz: ' mm' }[state.resultType];
-  const N = state.mesh.nodes, P = (n) => [N[3 * n], N[3 * n + 1], N[3 * n + 2]];
+  const N = RV().nodes, P = (n) => [N[3 * n], N[3 * n + 1], N[3 * n + 2]];
   viewer.setLabels([
     { pos: P(nMax), text: `MAX ${fmt(vMax, 4)}${unit}`, color: '#ff4d4d' },
     { pos: P(nMin), text: `MIN ${fmt(vMin, 4)}${unit}`, color: '#3d7bff' },
@@ -411,6 +418,7 @@ function renderParts() {
     el.innerHTML = `<input type="checkbox" ${p.visible ? 'checked' : ''} title="顯示/隱藏">
       <span class="sw" style="background:${p.color}"></span>
       <span class="name"></span>
+      ${p.material.cat ? `<span class="tag ${p.material.cat}">${CATEGORIES[p.material.cat]}</span>` : ''}
       <span class="meta">${p.material.name}${ne !== undefined ? `・${ne.toLocaleString()} 元素` : ''}</span>
       <button class="x" title="移除零件">✕</button>`;
     el.querySelector('.name').textContent = p.name;
@@ -428,7 +436,15 @@ function renderMaterial() {
   if (!p) return;
   const m = p.material;
   $('matPartName').textContent = `— ${p.name}`;
-  $('matKey').value = m.key;
+  buildMatOptions(m);
+  $('matRho').value = m.rho ?? '';
+  const mass = (p.volume * (m.rho || 0)) / 1e9; // mm³ × kg/m³ → kg
+  $('matMass').textContent = m.rho ? (mass >= 1 ? `${fmt(mass, 4)} kg` : `${fmt(mass * 1000, 4)} g`) : '—';
+  const notes = [];
+  if (m.brittle) notes.push('脆性材料：破壞前幾乎無塑性變形，建議以最大主應力判斷，彈塑性結果僅供參考。');
+  if (m.cat === 'plastic') notes.push('塑膠：數值為室溫、短時間負載的典型值，未考慮潛變、溫度與吸濕（尼龍）影響。');
+  $('matNote').hidden = !notes.length;
+  $('matNote').textContent = notes.join(' ');
   $('matE').value = +(m.E / 1000).toPrecision(5);
   $('matNu').value = m.nu;
   $('matSy').value = m.sy;
@@ -560,7 +576,7 @@ function renderResults() {
   html += `<tr><td colspan="4" style="color:var(--text-dim);font-size:11px;padding-top:8px">
     ${st.type.toUpperCase()}・元素 ${st.elements.toLocaleString()}・自由度 ${st.dofs.toLocaleString()}<br>
     ${plastic ? `負載步 ${r.steps.length}・Newton ${st.newton} 次・` : ''}PCG ${st.cg.toLocaleString()} 次・${st.seconds.toFixed(1)} s<br>
-    總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N</td></tr>`;
+    總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N${r.contact ? `<br>介面節點閉合 ${r.contact.closed}/${r.contact.springs}・最大穿透 ${fmt(r.contact.maxPen)} mm` : ''}</td></tr>`;
   $('statsTable').innerHTML = html;
 
   // 負載-位移曲線
@@ -582,6 +598,7 @@ function renderAll() {
   renderMaterial();
   renderBcs();
   renderMeshInfo();
+  renderContacts();
   renderResults();
   repaint();
 }
@@ -632,7 +649,7 @@ viewer.onHover = (hit) => {
   } else {
     viewer.setHover(null);
     const rm = state.mesh.resultMeshes.find((r) => r.partId === part.id);
-    const n = rm.vertexNode[hit.face.a];
+    const n = vnOf(rm)[hit.face.a];
     if (n >= 0 && state.results.used[n]) txt += `｜${RES_LABEL[state.resultType]}：${fmt(valueAt(n), 4)}`;
   }
   $('status').textContent = txt;
@@ -674,7 +691,7 @@ async function generateMesh() {
   res.display.forEach((d) => { if (d.wire) for (const n of d.wire) wire.push(n); });
   const resultMeshes = res.display.map((d, i) => ({ ...d, partId: state.parts[i].id }));
   viewer.setResultMeshes(resultMeshes);
-  state.mesh = { ...res, size, resultMeshes, wireNodes: wire.length ? Int32Array.from(wire) : null };
+  state.mesh = { ...res, size, resultMeshes, wireNodes: wire.length ? Int32Array.from(wire) : null, wireParts: res.display.map((d) => d.wire) };
   state.results = null;
   for (const w of res.warnings) log(w, 'w');
   log(`網格完成：${res.elemCount.toLocaleString()} 元素、${res.nodeCount.toLocaleString()} 節點（${res.seconds.toFixed(1)} s）`);
@@ -706,9 +723,12 @@ async function runSimulation() {
       materials: state.parts.map((p) => ({ ...p.material, name: p.name })),
       plastic, steps: +$('nSteps').value || 10, loadFactor: +$('loadFactor').value || 1, tol: +$('tol').value,
     };
-    log(`開始求解（${plastic ? '彈塑性' : '線彈性'}）…`);
-    const r = await fea.call('solve', { bcs, setup }, onProgress);
-    state.results = { ...r, stale: false };
+    const contacts = {};
+    for (const I of state.mesh.interfaces || []) contacts[`${I.a}-${I.b}`] = contactType(I);
+    const nl = Object.values(contacts).filter((t) => t !== 'bonded').length;
+    log(`開始求解（${plastic ? '彈塑性' : '線彈性'}${nl ? `，${nl} 組非黏合介面` : ''}）…`);
+    const r = await fea.call('solve', { bcs, setup, contacts }, onProgress);
+    state.results = { ...r, stale: false, view: buildResultView(r) };
     state.step = r.steps.length - 1;
     const last = curStep();
     state.deformScale = last.maxU > 0 ? +((modelSize() * 0.05) / last.maxU).toPrecision(2) : 1;
@@ -723,6 +743,48 @@ async function runSimulation() {
     showProgress(false);
     renderAll();
   }
+}
+
+/** 依求解回傳的節點拆分資訊，建立結果顯示用的節點／元素／頂點對照 */
+function buildResultView(r) {
+  const m = state.mesh;
+  const sp = r.split;
+  const vn = new Map(), wire = [];
+  m.resultMeshes.forEach((rm, i) => {
+    let map = null;
+    if (sp && sp.copies[i] && sp.copies[i][0].length) { map = new Map(); sp.copies[i][0].forEach((n, k) => map.set(n, sp.copies[i][1][k])); }
+    vn.set(rm.partId, map ? rm.vertexNode.map((n) => (n >= 0 ? map.get(n) ?? n : n)) : rm.vertexNode);
+    for (const n of m.wireParts?.[i] || []) wire.push(map ? map.get(n) ?? n : n);
+  });
+  return { nodes: sp ? sp.nodes : m.nodes, elems: sp ? sp.elems : m.elems, vn, wire: Int32Array.from(wire) };
+}
+
+// ---------- 零件結合 ----------
+const pairKey = (I) => { const a = state.parts[I.a]?.id, b = state.parts[I.b]?.id; return `${Math.min(a, b)}-${Math.max(a, b)}`; };
+const contactType = (I) => state.contacts[pairKey(I)] || 'bonded';
+
+function renderContacts() {
+  const box = $('contactBox');
+  const list = state.mesh?.interfaces;
+  if (!list) { box.className = 'empty'; box.textContent = state.parts.length > 1 ? '產生網格後會自動偵測互相接觸的零件。' : '單一零件，無需設定。'; return; }
+  if (!list.length) { box.className = 'empty'; box.textContent = '未偵測到互相接觸的零件（零件間沒有共用面）。'; return; }
+  box.className = '';
+  const opts = (sel) => Object.entries(CONTACT_TYPES).map(([k, v]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${v}</option>`).join('');
+  let html = `<div class="contact-all">全部設為<select id="contactAll"><option value="">—</option>${opts('')}</select></div>`;
+  list.forEach((I, i) => {
+    const a = state.parts[I.a]?.name, b = state.parts[I.b]?.name;
+    html += `<div class="contact-row"><span class="pair" title="${a} ↔ ${b}">${a} ↔ ${b}</span><span class="area">${fmt(I.area)} mm²</span>
+      <select data-ci="${i}">${opts(contactType(I))}</select></div>`;
+  });
+  html += `<div class="note" style="color:var(--text-dim)">接觸（可分離）屬非線性分析，求解時間較長；分離或滑動的零件須另有支撐，否則會出現剛體位移警告。</div>`;
+  box.innerHTML = html;
+  for (const sel of box.querySelectorAll('[data-ci]'))
+    sel.onchange = () => { state.contacts[pairKey(list[+sel.dataset.ci])] = sel.value; invalidateResults(); };
+  $('contactAll').onchange = (e) => {
+    if (!e.target.value) return;
+    for (const I of list) state.contacts[pairKey(I)] = e.target.value;
+    invalidateResults(); renderContacts();
+  };
 }
 
 // ---------- 匯出 ----------
@@ -744,7 +806,7 @@ $('btnCsv').onclick = () => {
   });
   rows.push([]);
   rows.push(['node', 'x_mm', 'y_mm', 'z_mm', 'ux_mm', 'uy_mm', 'uz_mm', 'vonMises_MPa', 'PEEQ']);
-  const N = state.mesh.nodes;
+  const N = RV().nodes;
   for (let n = 0; n < r.used.length; n++) {
     if (!r.used[n]) continue;
     rows.push([n + 1, ...[N[3 * n], N[3 * n + 1], N[3 * n + 2], s.u[3 * n], s.u[3 * n + 1], s.u[3 * n + 2], s.vm[n], s.pe[n]].map((v) => +v.toPrecision(6))]);
@@ -813,8 +875,40 @@ for (const btn of document.querySelectorAll('[data-add]'))
   };
 
 const matSel = $('matKey');
-matSel.innerHTML = Object.entries(MATERIALS).map(([k, m]) => `<option value="${k}">${m.name}</option>`).join('');
-matSel.onchange = () => { partById(state.selectedPartId).material = cloneMaterial(matSel.value); invalidateResults(); renderAll(); };
+/** 材料下拉選單：依分類（全部／金屬／塑膠）與子分類分組 */
+function buildMatOptions(current) {
+  const groups = new Map();
+  for (const [k, m] of Object.entries(MATERIALS)) {
+    if (state.matCat !== 'all' && m.cat !== state.matCat) continue;
+    const g = `${CATEGORIES[m.cat]}｜${m.group}`;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(`<option value="${k}">${m.name}</option>`);
+  }
+  let html = '';
+  if (current && (!MATERIALS[current.key] || (state.matCat !== 'all' && MATERIALS[current.key].cat !== state.matCat)))
+    html += `<optgroup label="目前材料"><option value="__cur">${current.name}</option></optgroup>`;
+  for (const [g, o] of groups) html += `<optgroup label="${g}">${o.join('')}</optgroup>`;
+  matSel.innerHTML = html;
+  matSel.value = MATERIALS[current?.key] && (state.matCat === 'all' || MATERIALS[current.key].cat === state.matCat) ? current.key : '__cur';
+}
+matSel.onchange = () => {
+  if (matSel.value === '__cur') return;
+  partById(state.selectedPartId).material = cloneMaterial(matSel.value);
+  invalidateResults(); renderAll();
+};
+for (const b of $('matCat').querySelectorAll('button'))
+  b.onclick = () => {
+    state.matCat = b.dataset.cat;
+    for (const x of $('matCat').querySelectorAll('button')) x.classList.toggle('on', x === b);
+    renderMaterial();
+  };
+$('matApplyAll').onclick = () => {
+  const p = partById(state.selectedPartId);
+  if (!p) return;
+  for (const q of state.parts) q.material = { ...p.material };
+  invalidateResults(); renderAll();
+  log(`已將「${p.material.name}」套用到全部 ${state.parts.length} 個零件`);
+};
 const matField = (id, key, scale = 1) => {
   $(id).onchange = (e) => {
     const p = partById(state.selectedPartId);
@@ -825,7 +919,7 @@ const matField = (id, key, scale = 1) => {
     invalidateResults(); renderAll();
   };
 };
-matField('matE', 'E', 1000); matField('matNu', 'nu'); matField('matSy', 'sy'); matField('matSu', 'su');
+matField('matE', 'E', 1000); matField('matNu', 'nu'); matField('matSy', 'sy'); matField('matSu', 'su'); matField('matRho', 'rho');
 
 $('btnMesh').onclick = meshOnly;
 $('btnRun').onclick = runSimulation;

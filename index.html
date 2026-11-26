@@ -26,13 +26,25 @@
       <section id="matSection" hidden>
         <h3>材料 <small id="matPartName"></small></h3>
         <div class="grid2">
+          <div class="full mat-cat">
+            <div class="seg seg-sm" id="matCat"><button data-cat="all" class="on">全部</button><button data-cat="metal">金屬</button><button data-cat="plastic">塑膠</button></div>
+            <button class="btn sm ghost" id="matApplyAll" title="將此材料套用到所有零件">套用到全部零件</button>
+          </div>
           <label class="full">材料庫<select id="matKey"></select></label>
           <label>E 楊氏模數 [GPa]<input id="matE" type="number" step="any" /></label>
           <label>ν 蒲松比<input id="matNu" type="number" step="0.01" min="0" max="0.49" /></label>
           <label>σy 降伏強度 [MPa]<input id="matSy" type="number" step="any" /></label>
           <label>σu 抗拉強度 [MPa]<input id="matSu" type="number" step="any" /></label>
+          <label>ρ 密度 [kg/m³]<input id="matRho" type="number" step="any" /></label>
+          <label>零件質量<span class="readout" id="matMass">—</span></label>
         </div>
+        <div class="note" id="matNote" hidden></div>
         <canvas id="ssChart" class="chart"></canvas>
+      </section>
+
+      <section>
+        <h3>零件結合</h3>
+        <div id="contactBox" class="empty">產生網格後會自動偵測互相接觸的零件。</div>
       </section>
 
       <section>

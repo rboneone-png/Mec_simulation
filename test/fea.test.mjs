@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { voxelMesh } from '../src/fea/mesh-voxel.js';
 import { tetwildMesh } from '../src/fea/mesh-tetwild.js';
 import { hexMesh } from '../src/fea/mesh-hex.js';
+import { detectInterfaces, applyInterfaces } from '../src/fea/contact.js';
 import { buildLoads } from '../src/fea/bc.js';
 import { solveStatic } from '../src/fea/solver.js';
 import { hardeningTable } from '../src/fea/plasticity.js';
@@ -41,14 +42,14 @@ function loadStep(path) {
   });
 }
 /** 找出中心座標在某軸為極值的面 */
-const faceAt = (part, axis, sign) => {
+const faceAt = (part, axis, sign, pi = 0) => {
   let best = 0, bv = -Infinity;
   part.faces.forEach((f, i) => {
     let s = 0; for (let k = axis; k < f.length; k += 3) s += f[k];
     const v = (sign * s) / (f.length / 3);
     if (v > bv) { bv = v; best = i; }
   });
-  return { part: 0, faceId: best, soup: part.faces[best] };
+  return { part: pi, faceId: best, soup: part.faces[best] };
 };
 
 const steel = { name: 'steel', E: 200000, nu: 0.3, sy: 250, su: 400, eu: 0.18 };
@@ -129,6 +130,46 @@ const r3 = solveStatic(mesh, { materials: [epp], plastic: true, steps: 4, fixed,
 const ok3 = r3.warnings.some((w) => w.includes('無法收斂'));
 if (!ok3) failed++;
 console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 ${r3.steps.length}/4 步）`);
+
+// ---------- 4. 零件結合（兩塊疊放）----------
+{
+  const stack = loadStep('test/data/stack.step');
+  const [lo, up] = stack[0].com[2] < stack[1].com[2] ? [0, 1] : [1, 0];
+  const parts = [stack[lo], stack[up]];
+  const mesh = hexMesh(parts, { size: 4, order: 2 });
+  const I = detectInterfaces(mesh);
+  const okI = I.length === 1 && Math.abs(I[0].area - 400) < 1;
+  if (!okI) failed++;
+  console.log(`${okI ? '✔' : '✘'} 偵測到接觸面：${I.length} 個，面積 ${I[0]?.area.toFixed(1)}（參考 400）`);
+  const run = (type, load) => {
+    const split = applyInterfaces(mesh, I, { '0-1': type }, [steel, steel], 4);
+    const cp = split.copies.map(([f, t]) => new Map(Array.from(f, (n, i) => [n, t[i]])));
+    const work = { type: mesh.type, nodes: split.nodes, elems: split.elems, elemPart: mesh.elemPart,
+      mapFace: (face, cb) => mesh.mapFace(face, (nw, a, n) => cb(nw.map(([nd, w]) => [cp[face.part].get(nd) ?? nd, w]), a, n)) };
+    const { fixed, F: Fv } = buildLoads(work, [
+      { name: 'fix', type: 'fixed', faces: [faceAt(parts[0], 2, -1, 0)] },
+      load.p !== undefined ? { name: 'p', type: 'pressure', p: load.p, faces: [faceAt(parts[1], 2, 1, 1)] }
+        : { name: 'f', type: 'force', vector: load.v, faces: [faceAt(parts[1], 2, 1, 1)] },
+    ]);
+    const r = solveStatic(work, { materials: [{ ...steel, name: 'lo' }, { ...steel, name: 'up' }], fixed, F: Fv, springs: split.springs });
+    return { lowerVM: r.steps[0].partMaxVM[0], maxU: r.steps[0].maxU, contact: r.contact, warnings: r.warnings };
+  };
+  const bC = run('bonded', { p: 10 }), fC = run('frictionless', { p: 10 });
+  check('  受壓：無摩擦接觸 ≈ 黏合（下塊應力）', fC.lowerVM, bC.lowerVM, 0.05);
+  const bT = run('bonded', { p: -10 }), fT = run('frictionless', { p: -10 });
+  const okT = fT.contact.closed === 0 && fT.warnings.some((w) => w.includes('分離'));
+  if (!okT) failed++;
+  console.log(`${okT ? '✔' : '✘'}   受拉：無摩擦接觸全部分離並發出警告（閉合 ${fT.contact.closed}/${fT.contact.springs}）`);
+  void bT;
+  const bS = run('bonded', { v: [4000, 0, 0] }), nS = run('noSeparation', { v: [4000, 0, 0] });
+  const bR = run('bonded', { v: [4000, 0, -20000] }), rS = run('rough', { v: [4000, 0, -20000] });
+  console.log(`    粗糙 vs 黏合（壓+剪）：下塊 ${rS.lowerVM.toFixed(2)} / ${bR.lowerVM.toFixed(2)} MPa，位移 ${rS.maxU.toExponential(3)} / ${bR.maxU.toExponential(3)}，閉合 ${rS.contact.closed}/${rS.contact.springs}`);
+  const okR = Math.abs(rS.maxU / bR.maxU - 1) < 0.1, okN = nS.maxU > 100 * bS.maxU;
+  if (!okR) failed++;
+  if (!okN) failed++;
+  console.log(`${okR ? '✔' : '✘'}   壓＋剪：粗糙接觸不滑動，位移與黏合一致`);
+  console.log(`${okN ? '✔' : '✘'}   剪力：無分離可滑動，上塊滑移（位移 ${nS.maxU.toExponential(2)} vs 黏合 ${bS.maxU.toExponential(2)} mm）`);
+}
 
 console.log(failed ? `\n${failed} 項失敗` : '\n全部通過');
 process.exit(failed ? 1 : 0);
