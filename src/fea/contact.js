@@ -5,6 +5,7 @@
 //   noSeparation 無分離：法向雙向拘束，可切向滑動
 //   frictionless 無摩擦接觸：法向僅受壓（可分離），可切向滑動
 //   rough        粗糙接觸：法向僅受壓（可分離），閉合時切向不可滑動
+//   frictional   摩擦接觸：法向僅受壓（可分離），切向依庫倫摩擦（|ft| ≤ μ·fn 黏著，超過則滑動）
 //   none         不結合：介面完全不傳力
 import { HEX20_EDGES, TET10_EDGES } from './elements.js';
 import { quadLoad, tri6Load } from './geom.js';
@@ -14,9 +15,14 @@ export const CONTACT_TYPES = {
   noSeparation: '無分離（可滑動）',
   frictionless: '無摩擦接觸（可分離）',
   rough: '粗糙接觸（可分離、不可滑動）',
+  frictional: '摩擦接觸（可分離，摩擦係數 μ）',
   none: '不結合',
 };
-export const SPRING_TYPE = { noSeparation: 1, frictionless: 2, rough: 3 };
+export const SPRING_TYPE = { noSeparation: 1, frictionless: 2, rough: 3, frictional: 4 };
+export const DEFAULT_MU = 0.2;
+
+/** 結合設定值可為字串（類型）或 { type, mu } */
+const norm = (v) => (typeof v === 'string' ? { type: v } : v || { type: 'bonded' });
 
 const HEXF = [[0, 4, 7, 3], [1, 2, 6, 5], [0, 1, 5, 4], [3, 7, 6, 2], [0, 3, 2, 1], [4, 5, 6, 7]];
 const edgeOf = (edges, a, b) => edges.findIndex(([p, q]) => (p === a && q === b) || (p === b && q === a));
@@ -74,7 +80,8 @@ export function detectInterfaces(mesh) {
  * 回傳 { nodes, elems, springs, copies }（copies[p] = [原節點, 新節點] 對照，顯示用）
  */
 export function applyInterfaces(mesh, interfaces, settings, materials, h, penalty = 10) {
-  const typeOf = (a, b) => settings?.[`${Math.min(a, b)}-${Math.max(a, b)}`] || 'bonded';
+  const cfgOf = (a, b) => norm(settings?.[`${Math.min(a, b)}-${Math.max(a, b)}`]);
+  const typeOf = (a, b) => cfgOf(a, b).type || 'bonded';
   const active = interfaces.filter((I) => typeOf(I.a, I.b) !== 'bonded');
   const nParts = materials.length;
   if (!active.length) return { nodes: mesh.nodes, elems: mesh.elems, springs: null, copies: Array.from({ length: nParts }, () => [[], []]), nOrig: mesh.nodes.length / 3 };
@@ -126,10 +133,11 @@ export function applyInterfaces(mesh, interfaces, settings, materials, h, penalt
 
   // 介面彈簧：每個介面節點的分擔面積與法向
   const faces = elementFaces(mesh.type);
-  const sa = [], sb = [], sn = [], sk = [], st = [];
+  const sa = [], sb = [], sn = [], sk = [], st = [], smu = [];
   for (const I of active) {
     const t = typeOf(I.a, I.b);
     if (t === 'none') continue;
+    const mu = Math.max(0, Number(cfgOf(I.a, I.b).mu ?? DEFAULT_MU) || 0);
     const acc = new Map(); // 原節點 → [面積, nx, ny, nz]
     for (let q = 0; q < I.faces.length; q += 2) {
       const e = I.faces[q], f = faces[I.faces[q + 1]];
@@ -151,11 +159,12 @@ export function applyInterfaces(mesh, interfaces, settings, materials, h, penalt
       sn.push(v[1] / l, v[2] / l, v[3] / l);
       sk.push((penalty * Eeff * v[0]) / h);
       st.push(SPRING_TYPE[t]);
+      smu.push(mu);
     }
   }
   const copies = copyOf.map((m) => [Int32Array.from(m.keys()), Int32Array.from(m.values())]);
   return {
     nodes, elems, nOrig: nNode, copies,
-    springs: sa.length ? { a: Int32Array.from(sa), b: Int32Array.from(sb), n: Float64Array.from(sn), k: Float64Array.from(sk), type: Uint8Array.from(st) } : null,
+    springs: sa.length ? { a: Int32Array.from(sa), b: Int32Array.from(sb), n: Float64Array.from(sn), k: Float64Array.from(sk), type: Uint8Array.from(st), mu: Float64Array.from(smu) } : null,
   };
 }

@@ -142,7 +142,7 @@ console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 $
   if (!okI) failed++;
   console.log(`${okI ? '✔' : '✘'} 偵測到接觸面：${I.length} 個，面積 ${I[0]?.area.toFixed(1)}（參考 400）`);
   const run = (type, load) => {
-    const split = applyInterfaces(mesh, I, { '0-1': type }, [steel, steel], 4);
+    const split = applyInterfaces(mesh, I, { '0-1': typeof type === 'string' ? type : type }, [steel, steel], 4);
     const cp = split.copies.map(([f, t]) => new Map(Array.from(f, (n, i) => [n, t[i]])));
     const work = { type: mesh.type, nodes: split.nodes, elems: split.elems, elemPart: mesh.elemPart,
       mapFace: (face, cb) => mesh.mapFace(face, (nw, a, n) => cb(nw.map(([nd, w]) => [cp[face.part].get(nd) ?? nd, w]), a, n)) };
@@ -152,7 +152,7 @@ console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 $
         : { name: 'f', type: 'force', vector: load.v, faces: [faceAt(parts[1], 2, 1, 1)] },
     ]);
     const r = solveStatic(work, { materials: [{ ...steel, name: 'lo' }, { ...steel, name: 'up' }], fixed, F: Fv, springs: split.springs });
-    return { lowerVM: r.steps[0].partMaxVM[0], maxU: r.steps[0].maxU, contact: r.contact, warnings: r.warnings };
+    return { lowerVM: r.steps[0].partMaxVM[0], maxU: r.steps[0].maxU, contact: r.contact, warnings: r.warnings, u: r.steps[0].u, nodes: split.nodes, elems: split.elems };
   };
   const bC = run('bonded', { p: 10 }), fC = run('frictionless', { p: 10 });
   check('  受壓：無摩擦接觸 ≈ 黏合（下塊應力）', fC.lowerVM, bC.lowerVM, 0.05);
@@ -169,6 +169,30 @@ console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 $
   if (!okN) failed++;
   console.log(`${okR ? '✔' : '✘'}   壓＋剪：粗糙接觸不滑動，位移與黏合一致`);
   console.log(`${okN ? '✔' : '✘'}   剪力：無分離可滑動，上塊滑移（位移 ${nS.maxU.toExponential(2)} vs 黏合 ${bS.maxU.toExponential(2)} mm）`);
+  // ---------- 摩擦接觸（μ = 0.3，正壓力 N = 20000 N → 最大靜摩擦 6000 N）----------
+  // 上塊頂面中心的 x 位移（扣除下塊同位置）作為滑移量
+  const slipOf = (r) => {
+    let up = 0, cu = 0, lo = 0, cl = 0;
+    for (let n = 0; n < r.nodes.length / 3; n++) {
+      const z = r.nodes[3 * n + 2];
+      if (Math.abs(z - 40) < 1e-6) { up += r.u[3 * n]; cu++; }
+      if (Math.abs(z - 20) < 1e-6) { lo += r.u[3 * n]; cl++; }
+    }
+    return up / cu - lo / cl;
+  };
+  const stick = run({ type: 'frictional', mu: 0.3 }, { v: [4000, 0, -20000] });
+  const slip = run({ type: 'frictional', mu: 0.3 }, { v: [8000, 0, -20000] });
+  const mu0 = run({ type: 'frictional', mu: 0 }, { v: [0, 0, -20000] });
+  const fr0 = run('frictionless', { v: [0, 0, -20000] });
+  console.log(`    摩擦 μ=0.3：T=4000（<μN）滑移 ${slipOf(stick).toExponential(2)} mm、滑動節點 ${stick.contact.sliding}；T=8000（>μN）滑移 ${slipOf(slip).toExponential(2)} mm、滑動節點 ${slip.contact.sliding}/${slip.contact.closed}`);
+  console.log(`    T=4000：位移 ${stick.maxU.toExponential(3)}（粗糙接觸 ${rS.maxU.toExponential(3)}），滑動 ${stick.contact.sliding}/${stick.contact.closed} 節點（低壓力邊緣局部滑動）`);
+  const okStick = Math.abs(stick.maxU / rS.maxU - 1) < 0.15 && Math.abs(slipOf(stick)) < 0.02 * slipOf(slip);
+  const okSlip = slipOf(slip) > 50 * Math.abs(slipOf(stick)) && slip.warnings.some((w) => w.includes('穩定化'));
+  const ok0 = Math.abs(mu0.maxU / fr0.maxU - 1) < 0.05;
+  for (const [ok, msg] of [[okStick, 'T < μN：整體不滑動（僅邊緣局部滑移），位移與粗糙接觸相近'], [okSlip, 'T > μN：整體滑動並警告（形成機構）'], [ok0, `μ = 0 受壓與無摩擦接觸一致（位移 ${mu0.maxU.toExponential(3)} / ${fr0.maxU.toExponential(3)}）`]]) {
+    if (!ok) failed++;
+    console.log(`${ok ? '✔' : '✘'}   ${msg}`);
+  }
 }
 
 console.log(failed ? `\n${failed} 項失敗` : '\n全部通過');

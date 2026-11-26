@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { Viewer } from './viewer.js';
 import { loadStep } from './importers.js';
 import { MATERIALS, CATEGORIES, cloneMaterial } from './materials.js';
-import { CONTACT_TYPES } from './fea/contact.js';
+import { CONTACT_TYPES, DEFAULT_MU } from './fea/contact.js';
 import { serializeProject, parseProject, safeFileName, saveBlob, PROJECT_EXT, hasSavePicker, saveWithPicker } from './project.js';
 import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots.js';
 
@@ -26,6 +26,7 @@ const state = {
   secAxis: 0,
   matCat: 'all',
   contacts: {}, // 'idA-idB' → 結合方式
+  contactMu: {}, // 'idA-idB' → 摩擦係數
   anim: { playing: false, t0: 0, lastStepT: 0 },
   showDeform: true,
   deformScale: 1,
@@ -124,7 +125,7 @@ function addFile(name, bytes, parts) {
 
 function clearAll() {
   fea.reset(new Error('已清除'));
-  Object.assign(state, { files: [], parts: [], bcs: [], activeBcId: null, selectedPartId: null, results: null, contacts: {} });
+  Object.assign(state, { files: [], parts: [], bcs: [], activeBcId: null, selectedPartId: null, results: null, contacts: {}, contactMu: {} });
   viewer.setParts([]);
   setMode('model');
   renderAll();
@@ -577,7 +578,7 @@ function renderResults() {
   html += `<tr><td colspan="4" style="color:var(--text-dim);font-size:11px;padding-top:8px">
     ${st.type.toUpperCase()}・元素 ${st.elements.toLocaleString()}・自由度 ${st.dofs.toLocaleString()}<br>
     ${plastic ? `負載步 ${r.steps.length}・Newton ${st.newton} 次・` : ''}PCG ${st.cg.toLocaleString()} 次・${st.seconds.toFixed(1)} s<br>
-    總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N${r.contact ? `<br>介面節點閉合 ${r.contact.closed}/${r.contact.springs}・最大穿透 ${fmt(r.contact.maxPen)} mm` : ''}</td></tr>`;
+    總負載 (${r.totalLoad.map((v) => fmt(v)).join(', ')}) N${r.contact ? `<br>介面節點閉合 ${r.contact.closed}/${r.contact.springs}${r.contact.sliding ? `（其中滑動 ${r.contact.sliding}）` : ''}・最大穿透 ${fmt(r.contact.maxPen)} mm` : ''}</td></tr>`;
   $('statsTable').innerHTML = html;
 
   // 負載-位移曲線
@@ -725,8 +726,8 @@ async function runSimulation() {
       plastic, steps: +$('nSteps').value || 10, loadFactor: +$('loadFactor').value || 1, tol: +$('tol').value,
     };
     const contacts = {};
-    for (const I of state.mesh.interfaces || []) contacts[`${I.a}-${I.b}`] = contactType(I);
-    const nl = Object.values(contacts).filter((t) => t !== 'bonded').length;
+    for (const I of state.mesh.interfaces || []) contacts[`${I.a}-${I.b}`] = { type: contactType(I), mu: contactMu(I) };
+    const nl = Object.values(contacts).filter((c) => c.type !== 'bonded').length;
     log(`開始求解（${plastic ? '彈塑性' : '線彈性'}${nl ? `，${nl} 組非黏合介面` : ''}）…`);
     const r = await fea.call('solve', { bcs, setup, contacts }, onProgress);
     state.results = { ...r, stale: false, view: buildResultView(r) };
@@ -763,6 +764,14 @@ function buildResultView(r) {
 // ---------- 零件結合 ----------
 const pairKey = (I) => { const a = state.parts[I.a]?.id, b = state.parts[I.b]?.id; return `${Math.min(a, b)}-${Math.max(a, b)}`; };
 const contactType = (I) => state.contacts[pairKey(I)] || 'bonded';
+const contactMu = (I) => state.contactMu[pairKey(I)] ?? DEFAULT_MU;
+const contactLabel = (I) => CONTACT_TYPES[contactType(I)] + (contactType(I) === 'frictional' ? `，μ = ${contactMu(I)}` : '');
+// 常見材料組合的靜摩擦係數（典型值，實際依表面處理、潤滑而異）
+const MU_PRESETS = [
+  ['鋼–鋼（乾燥、一般加工面）', 0.3], ['鋼–鋼（潤滑）', 0.1], ['鋼–鋼（噴砂／粗糙面）', 0.5],
+  ['鋁–鋼', 0.45], ['鋁–鋁（乾燥）', 0.5], ['銅–鋼', 0.5], ['鑄鐵–鋼', 0.2],
+  ['工程塑膠（POM／PA）–鋼', 0.2], ['PTFE–鋼', 0.05], ['橡膠–鋼', 0.8],
+];
 
 function renderContacts() {
   const box = $('contactBox');
@@ -771,16 +780,32 @@ function renderContacts() {
   if (!list.length) { box.className = 'empty'; box.textContent = '未偵測到互相接觸的零件（零件間沒有共用面）。'; return; }
   box.className = '';
   const opts = (sel) => Object.entries(CONTACT_TYPES).map(([k, v]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${v}</option>`).join('');
+  const presets = `<option value="">參考值…</option>` + MU_PRESETS.map(([n, v]) => `<option value="${v}">${n}：${v}</option>`).join('');
   let html = `<div class="contact-all">全部設為<select id="contactAll"><option value="">—</option>${opts('')}</select></div>`;
   list.forEach((I, i) => {
     const a = state.parts[I.a]?.name, b = state.parts[I.b]?.name;
+    const fr = contactType(I) === 'frictional';
     html += `<div class="contact-row"><span class="pair" title="${a} ↔ ${b}">${a} ↔ ${b}</span><span class="area">${fmt(I.area)} mm²</span>
-      <select data-ci="${i}">${opts(contactType(I))}</select></div>`;
+      <select data-ci="${i}">${opts(contactType(I))}</select>
+      ${fr ? `<div class="mu-row"><label>摩擦係數 μ<input type="number" data-mu="${i}" min="0" max="2" step="0.05" value="${contactMu(I)}"></label><select data-mup="${i}">${presets}</select></div>` : ''}</div>`;
   });
-  html += `<div class="note" style="color:var(--text-dim)">接觸（可分離）屬非線性分析，求解時間較長；分離或滑動的零件須另有支撐，否則會出現剛體位移警告。</div>`;
+  html += `<div class="note" style="color:var(--text-dim)">接觸（可分離）屬非線性分析，求解時間較長；分離或滑動的零件須另有支撐，否則會出現剛體位移警告。摩擦接觸：切向力 ≤ μ × 法向壓力時黏著，超過則滑動。</div>`;
   box.innerHTML = html;
   for (const sel of box.querySelectorAll('[data-ci]'))
-    sel.onchange = () => { state.contacts[pairKey(list[+sel.dataset.ci])] = sel.value; invalidateResults(); };
+    sel.onchange = () => { state.contacts[pairKey(list[+sel.dataset.ci])] = sel.value; invalidateResults(); renderContacts(); };
+  for (const inp of box.querySelectorAll('[data-mu]'))
+    inp.onchange = () => {
+      const v = Math.max(0, Math.min(2, +inp.value || 0));
+      inp.value = v;
+      state.contactMu[pairKey(list[+inp.dataset.mu])] = v;
+      invalidateResults();
+    };
+  for (const sel of box.querySelectorAll('[data-mup]'))
+    sel.onchange = () => {
+      if (!sel.value) return;
+      state.contactMu[pairKey(list[+sel.dataset.mup])] = +sel.value;
+      invalidateResults(); renderContacts();
+    };
   $('contactAll').onchange = (e) => {
     if (!e.target.value) return;
     for (const I of list) state.contacts[pairKey(I)] = e.target.value;
@@ -1028,10 +1053,12 @@ async function openProject(file) {
     faces: new Set(b.faces.filter(([pi]) => id(pi) !== undefined).map(([pi, fid]) => `${id(pi)}:${fid}`)),
   }));
   state.contacts = {};
-  for (const [k, v] of Object.entries(P.contacts || {})) {
-    const [a, b] = k.split('-').map((x) => id(+x));
-    if (a !== undefined && b !== undefined) state.contacts[`${Math.min(a, b)}-${Math.max(a, b)}`] = v;
-  }
+  state.contactMu = {};
+  for (const [src, dst] of [[P.contacts, state.contacts], [P.contactMu, state.contactMu]])
+    for (const [k, v] of Object.entries(src || {})) {
+      const [a, b] = k.split('-').map((x) => id(+x));
+      if (a !== undefined && b !== undefined) dst[`${Math.min(a, b)}-${Math.max(a, b)}`] = v;
+    }
   const S = P.settings || {};
   for (const [k, el] of [['meshMethod', 'meshMethod'], ['meshSize', 'meshSize'], ['anaType', 'anaType'], ['loadFactor', 'loadFactor'], ['nSteps', 'nSteps'], ['tol', 'tol'], ['bands', 'bands']])
     if (S[k] !== undefined) $(el).value = S[k];
@@ -1106,7 +1133,7 @@ function reportData(name) {
       name: b.name, type: BC_LABEL[b.type], faces: [...b.faces].map(faceName).join('、') || '（未選面）',
       value: b.type === 'force' ? `(${b.vector.map((v) => fmt(v)).join(', ')}) N` : b.type === 'pressure' ? `${fmt(b.p)} MPa` : bcDesc(b),
     })),
-    contacts: (state.mesh?.interfaces || []).map((I) => ({ pair: `${state.parts[I.a]?.name} ↔ ${state.parts[I.b]?.name}`, area: I.area, type: CONTACT_TYPES[contactType(I)] })),
+    contacts: (state.mesh?.interfaces || []).map((I) => ({ pair: `${state.parts[I.a]?.name} ↔ ${state.parts[I.b]?.name}`, area: I.area, type: contactLabel(I) })),
     analysis: {
       typeLabel: plastic ? '非線性靜力（彈塑性）' : '線性靜力',
       kv: [
@@ -1133,7 +1160,7 @@ function reportData(name) {
     const notes = [
       `總負載 (${R.totalLoad.map((v) => fmt(v)).join(', ')}) N${R.steps.length > 1 ? `，顯示負載步 ${state.step + 1}/${R.steps.length}（λ = ${fmt(s.lambda)}）` : ''}`,
       `${R.stats.type.toUpperCase()}・元素 ${R.stats.elements.toLocaleString()}・自由度 ${R.stats.dofs.toLocaleString()}・求解 ${R.stats.seconds.toFixed(1)} s`,
-      ...(R.contact ? [`介面節點閉合 ${R.contact.closed}/${R.contact.springs}，最大穿透 ${fmt(R.contact.maxPen)} mm`] : []),
+      ...(R.contact ? [`介面節點閉合 ${R.contact.closed}/${R.contact.springs}${R.contact.sliding ? `（其中摩擦滑動 ${R.contact.sliding}）` : ''}，最大穿透 ${fmt(R.contact.maxPen)} mm`] : []),
       ...(plastic ? [] : ['安全係數 = 降伏強度 / 最大 von Mises 應力（<1 紅、<1.5 橘）']),
     ];
     data.results = { cols, rows, notes, warnings: R.warnings || [] };
