@@ -4,11 +4,21 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MecSim 應力應變模擬</title>
-  <link rel="stylesheet" href="/src/style.css" />
+  <script>
+    // 讓 Gmsh（多執行緒 WASM）在無法設定標頭的靜態主機（如 GitHub Pages）上也能運作
+    if (!window.crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigator && !/^(localhost|127\.)/.test(location.hostname)) {
+      navigator.serviceWorker.register('coi-sw.js').then((reg) => {
+        const reload = () => { if (!sessionStorage.getItem('coiReloaded')) { sessionStorage.setItem('coiReloaded', '1'); location.reload(); } };
+        if (reg.active && !navigator.serviceWorker.controller) reload();
+        navigator.serviceWorker.addEventListener('controllerchange', reload);
+      }).catch((e) => console.warn('COI service worker 註冊失敗', e));
+    }
+  </script>
+  <link rel="stylesheet" href="./src/style.css" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">MecSim <span>線彈性結構分析</span></div>
+    <div class="brand">MecSim <span>結構分析・線性／彈塑性</span></div>
     <div class="top-actions">
       <label class="btn">匯入 STEP<input id="fileStep" type="file" accept=".step,.stp" multiple hidden /></label>
       <button id="btnDemo" class="btn ghost">載入示範組合件</button>
@@ -47,14 +57,35 @@
       </section>
 
       <section>
-        <h3>網格與求解</h3>
+        <h3>網格</h3>
         <div class="grid2">
-          <label class="full">網格解析度（最長邊元素數）<span class="val" id="resVal"></span>
-            <input id="resolution" type="range" min="16" max="120" step="2" value="48" /></label>
-          <label>收斂容許誤差<select id="tol"><option value="1e-5">1e-5</option><option value="1e-6" selected>1e-6</option><option value="1e-7">1e-7</option></select></label>
-          <label>元素尺寸 h<span class="readout" id="hVal">—</span></label>
+          <label class="full">網格方法<select id="meshMethod">
+            <option value="tet">四面體 TET10（Gmsh，貼合曲面）</option>
+            <option value="voxel">體素 HEX8（快速預覽）</option>
+          </select></label>
+          <label>元素尺寸 [mm]<input id="meshSize" type="number" step="any" min="0" placeholder="自動" /></label>
+          <label class="check" style="align-self:end"><input id="meshCurv" type="checkbox" checked /> 依曲率加密</label>
         </div>
-        <button id="btnRun" class="btn primary block">▶ 執行模擬</button>
+        <div class="note" id="coiNote" hidden></div>
+        <button id="btnMesh" class="btn sm block2">產生網格</button>
+        <div class="mesh-info" id="meshInfo">尚未產生網格</div>
+      </section>
+
+      <section>
+        <h3>分析設定</h3>
+        <div class="grid2">
+          <label class="full">分析類型<select id="anaType">
+            <option value="linear">線性靜力（線彈性）</option>
+            <option value="plastic">非線性靜力（彈塑性 J2，等向硬化）</option>
+          </select></label>
+          <label>負載倍率<input id="loadFactor" type="number" step="any" min="0" value="1" /></label>
+          <label class="plastic-only">負載步數<input id="nSteps" type="number" step="1" min="1" max="100" value="10" /></label>
+          <label>線性求解容許誤差<select id="tol"><option value="1e-5">1e-5</option><option value="1e-6" selected>1e-6</option><option value="1e-7">1e-7</option></select></label>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button id="btnRun" class="btn primary grow">▶ 執行模擬</button>
+          <button id="btnCancel" class="btn ghost" hidden>取消</button>
+        </div>
         <div class="progress" id="progress" hidden><div class="bar"></div><span class="txt"></span></div>
         <div id="log" class="log"></div>
       </section>
@@ -68,11 +99,14 @@
             <option value="ux">位移 Ux [mm]</option>
             <option value="uy">位移 Uy [mm]</option>
             <option value="uz">位移 Uz [mm]</option>
+            <option value="pe">等效塑性應變 PEEQ</option>
           </select></label>
+          <label class="full step-row" id="stepRow">負載步 <span class="val" id="stepVal"></span><input id="stepSlider" type="range" min="0" max="0" step="1" value="0" /></label>
           <label class="check"><input id="showDeform" type="checkbox" checked /> 顯示變形</label>
           <label>變形放大倍率<input id="deformScale" type="number" step="any" /></label>
         </div>
         <table class="stats" id="statsTable"></table>
+        <canvas id="ldChart" class="chart"></canvas>
         <div class="btn-row">
           <button id="btnShot" class="btn sm ghost">截圖 PNG</button>
           <button id="btnCsv" class="btn sm ghost">匯出 CSV</button>
@@ -96,6 +130,7 @@
           <button data-view="top">上</button>
         </div>
         <label class="check small"><input id="showEdges" type="checkbox" checked /> 邊線</label>
+        <label class="check small"><input id="showMesh" type="checkbox" /> 網格</label>
       </div>
       <div id="canvasHost" class="canvas-host"></div>
       <div id="pickHint" class="pick-hint" hidden></div>
@@ -107,6 +142,6 @@
       <div class="busy" id="busy" hidden><div class="spinner"></div><span id="busyTxt">處理中…</span></div>
     </section>
   </main>
-  <script type="module" src="/src/main.js"></script>
+  <script type="module" src="./src/main.js"></script>
 </body>
 </html>

@@ -96,6 +96,49 @@ export class Viewer {
     }
   }
 
+  /** 結果網格（每個零件一個，索引或非索引幾何） */
+  setResultMeshes(list) {
+    this.clearResultMeshes();
+    this.resultGroup = new THREE.Group();
+    for (const r of list) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(r.positions.slice(), 3));
+      g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(r.positions.length), 3));
+      if (r.index) g.setIndex(new THREE.BufferAttribute(r.index, 1));
+      const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+        vertexColors: true, roughness: 0.6, metalness: 0, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+      }));
+      mesh.userData = { partId: r.partId, result: true };
+      this.resultGroup.add(mesh);
+      r.mesh = mesh;
+    }
+    this.scene.add(this.resultGroup);
+  }
+
+  clearResultMeshes() {
+    if (!this.resultGroup) return;
+    this.resultGroup.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.(); });
+    this.scene.remove(this.resultGroup);
+    this.resultGroup = null;
+  }
+
+  showResult(on) {
+    if (this.resultGroup) this.resultGroup.visible = on;
+    this.group.visible = !on;
+  }
+
+  /** 網格線（節點對 → 線段），可帶變形 */
+  setWire(segments) {
+    if (this.wire) { this.scene.remove(this.wire); this.wire.geometry.dispose(); this.wire = null; }
+    if (!segments) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(segments, 3));
+    this.wire = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x0d1117, transparent: true, opacity: 0.55 }));
+    this.wire.renderOrder = 3;
+    this.scene.add(this.wire);
+  }
+
   setPartVisible(id, visible, opacity = 1) {
     const m = this.meshes.get(id);
     if (!m) return;
@@ -110,10 +153,12 @@ export class Viewer {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(ndc, this.camera);
-    const vis = [...this.meshes.values()].map((m) => m.mesh).filter((m) => m.visible);
+    const vis = this.resultGroup?.visible
+      ? this.resultGroup.children.filter((m) => m.visible)
+      : [...this.meshes.values()].map((m) => m.mesh).filter((m) => m.visible);
     const hit = this.raycaster.intersectObjects(vis, false)[0];
     if (!hit) return null;
-    return { partId: hit.object.userData.partId, tri: hit.faceIndex, point: hit.point };
+    return { partId: hit.object.userData.partId, tri: hit.faceIndex, point: hit.point, result: !!hit.object.userData.result, face: hit.face };
   }
 
   /** 以三角形 soup 顯示 hover 高亮 */
@@ -146,6 +191,7 @@ export class Viewer {
   bounds() {
     const box = new THREE.Box3();
     for (const { mesh } of this.meshes.values()) if (mesh.visible) box.expandByObject(mesh);
+    if (box.isEmpty()) for (const { mesh } of this.meshes.values()) box.expandByObject(mesh);
     return box;
   }
 

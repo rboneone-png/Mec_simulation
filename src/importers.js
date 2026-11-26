@@ -23,6 +23,18 @@ function makePart(name, positions, normals, faceOfTri, faceCount, color) {
   geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(positions.length), 3));
   geometry.computeBoundingBox();
   const id = ++partSeq;
+  // 體積與質心（散度定理），供 Gmsh 幾何比對
+  let V = 0;
+  const c = [0, 0, 0];
+  for (let i = 0; i < positions.length; i += 9) {
+    const ax = positions[i], ay = positions[i + 1], az = positions[i + 2];
+    const bx = positions[i + 3], by = positions[i + 4], bz = positions[i + 5];
+    const cx = positions[i + 6], cy = positions[i + 7], cz = positions[i + 8];
+    const v = (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6;
+    V += v;
+    c[0] += (v * (ax + bx + cx)) / 4; c[1] += (v * (ay + by + cy)) / 4; c[2] += (v * (az + bz + cz)) / 4;
+  }
+  const bb = geometry.boundingBox;
   return {
     id,
     name: name || `Part ${id}`,
@@ -31,13 +43,17 @@ function makePart(name, positions, normals, faceOfTri, faceCount, color) {
     basePositions: positions.slice(),
     faceOfTri,
     faceCount,
+    volume: Math.abs(V),
+    com: V ? c.map((x) => x / V) : bb.getCenter(new THREE.Vector3()).toArray(),
+    bbox: [bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z],
   };
 }
 
-/** 讀取 STEP 檔，每個實體 mesh 成為一個零件 */
+/** 讀取 STEP 檔，每個實體 mesh 成為一個零件；回傳 { bytes, parts } */
 export async function loadStep(file) {
   const occt = await getOcct();
   const buf = new Uint8Array(await file.arrayBuffer());
+  const bytes = buf.slice();
   const params = {
     linearUnit: 'millimeter',
     linearDeflectionType: 'bounding_box_ratio',
@@ -47,7 +63,7 @@ export async function loadStep(file) {
   const res = occt.ReadStepFile(buf, params);
   if (!res.success) throw new Error(`無法解析 STEP 檔：${file.name}`);
   const base = file.name.replace(/\.(step|stp)$/i, '');
-  return res.meshes.map((m, mi) => {
+  const parts = res.meshes.map((m, mi) => {
     const P = m.attributes.position.array;
     const N = m.attributes.normal?.array;
     const I = m.index.array;
@@ -66,22 +82,5 @@ export async function loadStep(file) {
     const name = (m.name && !/^Open CASCADE/i.test(m.name) ? m.name : null) || (res.meshes.length > 1 ? `${base}_${mi + 1}` : base);
     return makePart(name, positions, normals, faceOfTri, faces.length + (hasExtra ? 1 : 0));
   });
-}
-
-function boxPart(name, x0, y0, z0, x1, y1, z1, color) {
-  const g = new THREE.BoxGeometry(x1 - x0, y1 - y0, z1 - z0).toNonIndexed();
-  g.translate((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
-  const triCount = g.attributes.position.count / 3;
-  const faceOfTri = new Int32Array(triCount);
-  g.groups.forEach((gr, fi) => { for (let t = gr.start / 3; t < (gr.start + gr.count) / 3; t++) faceOfTri[t] = fi; });
-  return makePart(name, g.attributes.position.array.slice(), g.attributes.normal.array.slice(), faceOfTri, 6, color);
-}
-
-/** 示範組合件：底板 + 立柱 + 肋板（三件，黏合接觸） */
-export function demoAssembly() {
-  return [
-    boxPart('底板', 0, 0, 0, 160, 40, 12, '#8fa3b8'),
-    boxPart('立柱', 130, 0, 12, 160, 40, 90, '#c9a26b'),
-    boxPart('肋板', 110, 15, 12, 130, 25, 50, '#7fb28a'),
-  ];
+  return { bytes, parts };
 }

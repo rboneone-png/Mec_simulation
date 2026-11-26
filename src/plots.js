@@ -37,7 +37,8 @@ export function fmt(v, digits = 3) {
 }
 
 /** 在 canvas 上繪製應力-應變曲線，maxStress 為模擬最大 von Mises（可選） */
-export function drawStressStrain(canvas, m, maxStress) {
+export function drawStressStrain(canvas, m, sim) {
+  const maxStress = sim?.stress || 0;
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth, H = canvas.clientHeight;
   canvas.width = W * dpr; canvas.height = H * dpr;
@@ -85,9 +86,41 @@ export function drawStressStrain(canvas, m, maxStress) {
     const y = Y(maxStress);
     ctx.setLineDash([4, 4]); ctx.strokeStyle = '#ff5c8a'; ctx.lineWidth = 1.2;
     ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke(); ctx.setLineDash([]);
-    const e = maxStress <= m.sy ? maxStress / m.E : null;
+    // 對應點：ε = σ/E + εp（小應變近似）
+    const e = maxStress / m.E + (sim.peeq || 0);
     ctx.fillStyle = '#ff5c8a'; ctx.textAlign = 'right';
-    ctx.fillText(`模擬最大 σvm ${fmt(maxStress)}`, W - R - 2, y - 4);
-    if (e !== null) { ctx.beginPath(); ctx.arc(X(e), y, 4, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillText(`模擬最大 σvm ${fmt(maxStress)}${sim.peeq > 0 ? `・εp ${sim.peeq.toExponential(1)}` : ''}`, W - R - 2, y - 4);
+    if (e <= xMax) { ctx.beginPath(); ctx.arc(X(e), y, 4, 0, Math.PI * 2); ctx.fill(); }
   }
+}
+
+/** 一般 XY 曲線（負載-位移），cur 為高亮點索引 */
+export function drawCurve(canvas, pts, cur, xLabel, yLabel, title) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const fg = css.getPropertyValue('--text-dim').trim(), line = css.getPropertyValue('--line').trim(), accent = css.getPropertyValue('--accent').trim();
+  const Lm = 52, R = 12, T = 22, B = 30;
+  const xMax = Math.max(...pts.map((p) => p[0])) * 1.08 || 1, yMax = Math.max(...pts.map((p) => p[1])) * 1.1 || 1;
+  const X = (v) => Lm + (v / xMax) * (W - Lm - R), Y = (v) => H - B - (v / yMax) * (H - T - B);
+  ctx.font = '10px system-ui, sans-serif'; ctx.fillStyle = fg; ctx.strokeStyle = line; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = Y((yMax * i) / 4);
+    ctx.beginPath(); ctx.moveTo(Lm, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(fmt((yMax * i) / 4), Lm - 4, y + 3);
+    ctx.textAlign = 'center'; ctx.fillText(fmt((xMax * i) / 4), X((xMax * i) / 4), H - B + 13);
+  }
+  ctx.textAlign = 'center'; ctx.fillText(xLabel, (Lm + W - R) / 2, H - 4);
+  ctx.textAlign = 'left'; ctx.fillText(`${title}（縱軸：${yLabel}）`, Lm, 12);
+  ctx.strokeStyle = accent; ctx.lineWidth = 2; ctx.beginPath();
+  pts.forEach(([x, y], i) => (i ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y))));
+  ctx.stroke();
+  pts.forEach(([x, y], i) => {
+    ctx.fillStyle = i === cur ? '#ff5c8a' : accent;
+    ctx.beginPath(); ctx.arc(X(x), Y(y), i === cur ? 5 : 2.5, 0, Math.PI * 2); ctx.fill();
+  });
 }
