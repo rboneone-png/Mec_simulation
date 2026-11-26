@@ -166,9 +166,13 @@ function incompleteCholesky(A, free) {
   return null;
 }
 
-function pcg(A, b, x, free, tol, maxIter, onIter) {
+export function makePreconditioner(A, free) {
+  return incompleteCholesky(A, free) || blockJacobi(A, free);
+}
+
+function pcg(A, b, x, free, tol, maxIter, onIter, precIn) {
   const n = b.length;
-  const prec = incompleteCholesky(A, free) || blockJacobi(A, free);
+  const prec = precIn || makePreconditioner(A, free);
   const r = new Float64Array(n), z = new Float64Array(n), p = new Float64Array(n), Ap = new Float64Array(n);
   const dot = (a, c) => { let s = 0; for (let i = 0; i < n; i++) s += a[i] * c[i]; return s; };
   csrMul(A, x, Ap, free);
@@ -370,6 +374,9 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   let k = 1;
   const nlTol = 1e-4;
   const uSave = new Float64Array(nDof);
+  let prec = null;
+  const lastInc = new Float64Array(nDof); // 上一收斂步的位移增量（預測用）
+  let lastDLam = 0;
   while (k <= nSteps) {
     const lam = Math.min(lamDone + dLam, lamTarget(k));
     uSave.set(u);
@@ -387,11 +394,17 @@ export function solveStatic(mesh, setup, progress = () => {}) {
       if (!Number.isFinite(rn) || (it > 2 && rn > 10 * prevRn) || (it >= 8 && rn > 1e-2)) break;
       prevRn = rn;
       const du = new Float64Array(nDof);
+      // 熱啟動：每步第一次迭代以前一步增量（依負載增量比例縮放）作為初始猜測
+      if (plastic && it === 0 && lastDLam > 0) { const sc = (lam - lamDone) / lastDLam; for (let d = 0; d < nDof; d++) du[d] = lastInc[d] * sc; }
+      // 非精確 Newton：線性求解容許誤差隨殘差調整（收斂仍以真實殘差判斷）
+      const cgTol = plastic ? Math.min(1e-2, Math.max(linTol, (0.3 * nlTol) / Math.max(rn, 1e-12))) : linTol;
       const cgMax = plastic ? Math.max(3000, Math.round(Math.sqrt(nDof) * 40)) : 50000;
-      const res = pcg(A, r, du, free, plastic ? Math.min(1e-5, linTol * 10) : linTol, cgMax, (ci, cr) =>
-        progress({ stage: plastic ? `負載步 ${k}/${nSteps}・Newton ${it + 1}` : '求解線性系統', frac: 0.08 + (0.85 * (lamDone + (lam - lamDone) * 0.5)) / loadFactor, iter: ci, residual: cr }));
+      // 前置條件：每個負載步只分解一次，Newton 迭代間重複使用（切線矩陣變化不大）
+      if (it === 0 || !prec) prec = makePreconditioner(A, free);
+      const res = pcg(A, r, du, free, cgTol, cgMax, (ci, cr) =>
+        progress({ stage: plastic ? `負載步 ${k}/${nSteps}・Newton ${it + 1}` : '求解線性系統', frac: 0.08 + (0.85 * (lamDone + (lam - lamDone) * 0.5)) / loadFactor, iter: ci, residual: cr }), prec);
       totalCG += res.iterations;
-      if (plastic && !(res.residual < 1e-2)) break; // 切線矩陣近奇異（接近極限負載）
+      if (plastic && !(res.residual < Math.max(0.05, cgTol * 5))) break; // 切線矩陣近奇異（接近極限負載）
       for (let d = 0; d < nDof; d++) u[d] += du[d];
       totalNewton++;
       if (!plastic) { assemble(u, false); converged = true; lastRes = res.residual; break; }
@@ -414,6 +427,8 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     // 收斂：提交狀態
     [epsP, epsPN] = [epsPN, epsP];
     [alpha, alphaN] = [alphaN, alpha];
+    for (let d = 0; d < nDof; d++) lastInc[d] = u[d] - uSave[d];
+    lastDLam = lam - lamDone;
     lamDone = lam;
     if (Math.abs(lam - lamTarget(k)) < 1e-12 * loadFactor) {
       const o = nodeOut(u);

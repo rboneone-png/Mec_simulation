@@ -50,8 +50,9 @@
         <h3>網格</h3>
         <div class="grid2">
           <label class="full">網格方法<select id="meshMethod">
-            <option value="tet">四面體 TET10（fTetWild，貼合曲面）</option>
-            <option value="voxel">體素 HEX8（快速預覽）</option>
+            <option value="hex20">六面體 HEX20（貼體二次元素，建議）</option>
+            <option value="hex8">六面體 HEX8（貼體一次元素）</option>
+            <option value="tet">四面體 TET10（fTetWild）</option>
           </select></label>
           <label>元素尺寸 [mm]<input id="meshSize" type="number" step="any" min="0" placeholder="自動" /></label>
         </div>
@@ -92,6 +93,32 @@
           <label class="full step-row" id="stepRow">負載步 <span class="val" id="stepVal"></span><input id="stepSlider" type="range" min="0" max="0" step="1" value="0" /></label>
           <label class="check"><input id="showDeform" type="checkbox" checked /> 顯示變形</label>
           <label>變形放大倍率<input id="deformScale" type="number" step="any" /></label>
+          <label>等值線<select id="bands">
+            <option value="0">連續漸層</option><option value="8">8 段</option><option value="12" selected>12 段</option><option value="16">16 段</option><option value="24">24 段</option>
+          </select></label>
+          <label class="check" style="align-self:end"><input id="showMinMax" type="checkbox" checked /> 標示最大／最小</label>
+        </div>
+
+        <div class="subhead">剖面</div>
+        <div class="grid2">
+          <label class="check"><input id="secOn" type="checkbox" /> 啟用剖面</label>
+          <div class="seg seg-sm" id="secAxis"><button data-axis="0" class="on">X</button><button data-axis="1">Y</button><button data-axis="2">Z</button></div>
+          <label class="full">位置 <span class="val" id="secVal"></span><input id="secPos" type="range" min="0" max="1000" value="500" /></label>
+          <label class="check"><input id="secFlip" type="checkbox" /> 反向</label>
+        </div>
+
+        <div class="subhead">動態展示</div>
+        <div class="grid2">
+          <label class="full">動畫類型<select id="animType">
+            <option value="deform">變形動畫（0 → 最大，往返）</option>
+            <option value="deform1">變形動畫（0 → 最大，單向循環）</option>
+            <option value="steps">負載步播放（彈塑性）</option>
+          </select></label>
+          <label class="full">速度 <span class="val" id="animSpeedVal"></span><input id="animSpeed" type="range" min="0.25" max="3" step="0.25" value="1" /></label>
+        </div>
+        <div class="btn-row" style="margin-top:8px">
+          <button id="btnPlay" class="btn sm">▶ 播放</button>
+          <button id="btnRec" class="btn sm ghost">● 錄製 WebM</button>
         </div>
         <table class="stats" id="statsTable"></table>
         <canvas id="ldChart" class="chart"></canvas>
@@ -119,6 +146,7 @@
         </div>
         <label class="check small"><input id="showEdges" type="checkbox" checked /> 邊線</label>
         <label class="check small"><input id="showMesh" type="checkbox" /> 網格</label>
+        <label class="check small"><input id="hiQ" type="checkbox" /> 高畫質</label>
       </div>
       <div id="canvasHost" class="canvas-host"></div>
       <div id="pickHint" class="pick-hint" hidden></div>

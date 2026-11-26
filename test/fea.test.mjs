@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { voxelMesh } from '../src/fea/mesh-voxel.js';
 import { tetwildMesh } from '../src/fea/mesh-tetwild.js';
+import { hexMesh } from '../src/fea/mesh-hex.js';
 import { buildLoads } from '../src/fea/bc.js';
 import { solveStatic } from '../src/fea/solver.js';
 import { hardeningTable } from '../src/fea/plasticity.js';
@@ -65,6 +66,8 @@ const beamBCs = (p) => [
 
 for (const [label, mesh] of [
   ['HEX8 體素 h=2.5', voxelMesh(beam, 2.5)],
+  ['HEX20 貼體 h=5', hexMesh(beam, { size: 5, order: 2 })],
+  ['HEX8 貼體 h=2.5', hexMesh(beam, { size: 2.5, order: 1 })],
   ['TET10 fTetWild h=6', await tetwildMesh(beam, { size: 6 })],
 ]) {
   const { fixed, F: Fv } = buildLoads(mesh, beamBCs(beam[0]));
@@ -81,9 +84,26 @@ for (const [label, mesh] of [
   check('  x=L/4 上表面彎曲應力', sv, (F * (L - L / 4) * (t / 2)) / I, 0.08);
 }
 
+// ---------- 1b. 圓棒懸臂（曲面）----------
+const rod = loadStep('test/data/rod.step');
+const Ir = (Math.PI * 10 ** 4) / 4, dRod = (F * L ** 3) / (3 * steel.E * Ir);
+for (const [label, mk] of [['HEX20 貼體 h=4', () => hexMesh(rod, { size: 4, order: 2 })], ['TET10 fTetWild h=5', () => tetwildMesh(rod, { size: 5 })]]) {
+  const mesh = await mk();
+  const { fixed, F: Fv } = buildLoads(mesh, beamBCs(rod[0]));
+  const r = solveStatic(mesh, { materials: [steel], fixed, F: Fv, tol: 1e-8 });
+  // 體積檢查（曲面貼合程度）
+  let V = 0;
+  const { precomputeGeometry } = await import('../src/fea/elements.js');
+  const geo = precomputeGeometry(mesh.type, mesh.nodes, mesh.elems);
+  for (const w of geo.wdet) V += w;
+  console.log(`— 圓棒 ${label}：${r.stats.elements} 元素、${r.stats.dofs} 自由度、${r.stats.seconds}s`);
+  check('  網格體積', V, Math.PI * 100 * 200, 0.01);
+  check('  懸臂端撓度 δ', r.steps[0].maxU, dRod, 0.04);
+}
+
 // ---------- 2. 單軸拉伸（彈塑性，TET10） ----------
 const bar = loadStep('test/data/bar.step');
-const mesh = await tetwildMesh(bar, { size: 4 });
+const mesh = hexMesh(bar, { size: 2.5, order: 2 });
 const A = 100, sigma = 330; // 超過降伏 250 MPa
 const bcs = [
   { name: 'x0', type: 'fixed', dirs: [true, false, false], faces: [faceAt(bar[0], 0, -1)] },
@@ -97,7 +117,7 @@ const last = r.steps[r.steps.length - 1];
 const tab = hardeningTable(steel);
 let epRef = 0;
 for (let i = 1; i < tab.ep.length; i++) if (tab.sy[i] >= sigma) { epRef = tab.ep[i - 1] + ((sigma - tab.sy[i - 1]) / (tab.sy[i] - tab.sy[i - 1])) * (tab.ep[i] - tab.ep[i - 1]); break; }
-console.log(`— 單軸拉伸 TET10：${r.stats.elements} 元素、Newton ${r.stats.newton} 次、${r.stats.seconds}s、${r.steps.length} 步`);
+console.log(`— 單軸拉伸 HEX20：${r.stats.elements} 元素、Newton ${r.stats.newton} 次、${r.stats.seconds}s、${r.steps.length} 步`);
 check('  von Mises = 施加應力', last.maxVM, sigma, 0.01);
 check('  等效塑性應變', last.maxPE, epRef, 0.03);
 let ux = 0; for (let n = 0; n < mesh.nodes.length / 3; n++) ux = Math.max(ux, last.u[3 * n]);

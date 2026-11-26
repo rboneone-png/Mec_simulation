@@ -133,3 +133,8 @@ label.small { background: rgba(27,31,38,.9); padding: 4px 8px; border-radius: 6p
 .dirs { display: flex; gap: 12px; margin-top: 6px; }
 .dirs label { display: flex; gap: 4px; align-items: center; font-size: 12px; color: var(--text); }
 body:not(.plastic) .plastic-only { display: none !important; }
+
+.subhead { margin: 14px 0 8px; font-size: 11px; color: var(--text-dim); letter-spacing: .6px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.seg-sm button { padding: 3px 12px; font-size: 12px; }
+.seg-sm { align-self: center; justify-self: start; }
+.btn.rec { background: #c0392b; border-color: #c0392b; color: #fff; }

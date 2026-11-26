@@ -123,3 +123,44 @@ export function tri6Load(nodes, tn, opp) {
   }
   return { nw: Array.from(tn, (nd, k) => [nd, area > 0 ? w[k] / area : 0]), area, n };
 }
+
+// quad4 / quad8 面（節點：角點 0-3 逆時針朝外；quad8 另有 4:(0,1) 5:(1,2) 6:(2,3) 7:(3,0)）
+const QS = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+function quadShape(nn, x, y) {
+  const N = new Array(nn).fill(0), dN = Array.from({ length: nn }, () => [0, 0]);
+  if (nn === 4) {
+    QS.forEach(([a, b], k) => { N[k] = ((1 + a * x) * (1 + b * y)) / 4; dN[k] = [(a * (1 + b * y)) / 4, (b * (1 + a * x)) / 4]; });
+  } else {
+    QS.forEach(([a, b], k) => {
+      N[k] = ((1 + a * x) * (1 + b * y) * (a * x + b * y - 1)) / 4;
+      dN[k] = [(a * (1 + b * y) * (2 * a * x + b * y)) / 4, (b * (1 + a * x) * (a * x + 2 * b * y)) / 4];
+    });
+    [[0, -1], [1, 0], [0, 1], [-1, 0]].forEach(([a, b], j) => {
+      const k = 4 + j;
+      if (a === 0) { N[k] = ((1 - x * x) * (1 + b * y)) / 2; dN[k] = [-x * (1 + b * y), ((1 - x * x) * b) / 2]; }
+      else { N[k] = ((1 + a * x) * (1 - y * y)) / 2; dN[k] = [(a * (1 - y * y)) / 2, -y * (1 + a * x)]; }
+    });
+  }
+  return { N, dN };
+}
+const QG = [-Math.sqrt(0.6), 0, Math.sqrt(0.6)], QW = [5 / 9, 8 / 9, 5 / 9];
+
+/** quad4/quad8 面的一致性節點權重、面積與外法向（依節點順序右手定則） */
+export function quadLoad(nodes, qn) {
+  const nn = qn.length;
+  const w = new Array(nn).fill(0), nrm = [0, 0, 0];
+  let area = 0;
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++) {
+      const { N, dN } = quadShape(nn, QG[i], QG[j]);
+      const a = [0, 0, 0], b = [0, 0, 0];
+      for (let k = 0; k < nn; k++) for (let d = 0; d < 3; d++) { a[d] += dN[k][0] * nodes[3 * qn[k] + d]; b[d] += dN[k][1] * nodes[3 * qn[k] + d]; }
+      const cr = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+      const dA = Math.hypot(...cr) * QW[i] * QW[j];
+      area += dA;
+      for (let d = 0; d < 3; d++) nrm[d] += cr[d] * QW[i] * QW[j];
+      for (let k = 0; k < nn; k++) w[k] += N[k] * dA;
+    }
+  const nl = Math.hypot(...nrm) || 1;
+  return { nw: Array.from(qn, (nd, k) => [nd, area > 0 ? w[k] / area : 0]), area, n: nrm.map((v) => v / nl) };
+}
