@@ -3,6 +3,7 @@ import { Viewer } from './viewer.js';
 import { loadStep } from './importers.js';
 import { MATERIALS, CATEGORIES, cloneMaterial } from './materials.js';
 import { CONTACT_TYPES } from './fea/contact.js';
+import { serializeProject, parseProject, safeFileName, saveBlob, PROJECT_EXT, hasSavePicker, saveWithPicker } from './project.js';
 import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots.js';
 
 const $ = (id) => document.getElementById(id);
@@ -110,8 +111,8 @@ function addFile(name, bytes, parts) {
   const fileIdx = state.files.push({ name, bytes }) - 1;
   for (const p of parts) {
     p.fileIdx = fileIdx;
-    p.material = cloneMaterial('steel');
-    p.visible = true;
+    p.material ??= cloneMaterial('steel');
+    p.visible ??= true;
     state.parts.push(p);
   }
   clearMesh();
@@ -826,6 +827,7 @@ async function withBusy(msg, fn) {
 async function importFile(file) {
   const { bytes, parts } = await loadStep(file);
   if (!parts.length) throw new Error(`${file.name} 中沒有可用的實體`);
+  parts.forEach((p, i) => (p.meshIdx = i));
   addFile(file.name, bytes, parts);
   log(`已匯入 ${file.name}：${parts.length} 個零件`);
   return parts;
@@ -944,6 +946,250 @@ $('splitter').onpointerdown = (e) => {
   window.addEventListener('pointerup', up);
   e.preventDefault();
 };
+
+// ---------- 檔名對話框 ----------
+function askName(title, def, ext, hint = '') {
+  return new Promise((resolve) => {
+    $('dlgTitle').textContent = title;
+    $('dlgName').value = def;
+    $('dlgExt').textContent = ext;
+    $('dlgHint').textContent = hint;
+    $('nameDlg').hidden = false;
+    setTimeout(() => { $('dlgName').focus(); $('dlgName').select(); }, 0);
+    const done = (v) => { $('nameDlg').hidden = true; $('nameForm').onsubmit = $('dlgCancel').onclick = $('nameDlg').onkeydown = null; resolve(v); };
+    $('nameForm').onsubmit = (e) => { e.preventDefault(); const v = $('dlgName').value.trim(); if (v) done(v); };
+    $('dlgCancel').onclick = () => done(null);
+    $('nameDlg').onkeydown = (e) => { if (e.key === 'Escape') done(null); };
+  });
+}
+
+/**
+ * 存檔並自訂名稱：支援時用系統「另存新檔」（可選資料夾、中文檔名可靠），否則用自訂對話框後下載
+ * makeBlob(name) 依名稱產生內容；回傳最終名稱（不含副檔名），取消回傳 null
+ */
+async function saveNamed({ title, def, ext, mime, desc, hint, makeBlob }) {
+  if (hasSavePicker()) {
+    try {
+      return await saveWithPicker(makeBlob, safeFileName(def) + ext, ext, mime, desc);
+    } catch (e) { console.warn('系統存檔對話框無法使用，改用下載', e); }
+  }
+  const name = await askName(title, def, ext, hint);
+  if (!name) return null;
+  await saveBlob(await makeBlob(name), safeFileName(name) + ext);
+  return name;
+}
+
+// ---------- 專案：儲存／開啟 ----------
+const projName = () => $('projName').value.trim() || '未命名專案';
+function currentSettings() {
+  return {
+    meshMethod: $('meshMethod').value, meshSize: $('meshSize').value, anaType: $('anaType').value,
+    loadFactor: $('loadFactor').value, nSteps: $('nSteps').value, tol: $('tol').value, bands: $('bands').value,
+  };
+}
+
+async function saveProject() {
+  if (!state.parts.length) return alert('目前沒有模型可儲存');
+  let size = 0;
+  const name = await saveNamed({
+    title: '儲存專案', def: projName(), ext: PROJECT_EXT, mime: 'application/json', desc: 'MecSim 專案檔',
+    hint: '包含 STEP 幾何、材料、邊界條件、零件結合與分析設定（不含計算結果）。',
+    makeBlob: (n) => { const json = JSON.stringify(serializeProject(state, n, currentSettings())); size = json.length; return new Blob([json], { type: 'application/json' }); },
+  });
+  if (!name) return;
+  $('projName').value = name;
+  log(`已儲存專案：${safeFileName(name)}${PROJECT_EXT}（${(size / 1024).toFixed(0)} KB）`);
+}
+
+async function openProject(file) {
+  const P = parseProject(await file.text());
+  clearAll();
+  // 依檔案載入 STEP，再依專案中的零件清單（順序、名稱、材料…）重建
+  const loaded = [];
+  for (const f of P.files) {
+    const { parts } = await loadStep(new File([f.bytes], f.name));
+    parts.forEach((p, i) => (p.meshIdx = i));
+    loaded.push(parts);
+  }
+  const ordered = P.parts.map((pp) => {
+    const part = loaded[pp.file]?.[pp.mesh];
+    if (!part) throw new Error(`專案中的零件「${pp.name}」在 STEP 檔中找不到`);
+    Object.assign(part, { name: pp.name, color: pp.color, visible: pp.visible !== false, material: { ...pp.material } });
+    return part;
+  });
+  P.files.forEach((f, fi) => {
+    const fileIdx = state.files.push({ name: f.name, bytes: f.bytes }) - 1;
+    for (const part of ordered) if (loaded[fi].includes(part)) part.fileIdx = fileIdx;
+  });
+  state.parts = ordered;
+  const id = (i) => ordered[i]?.id;
+  state.bcs = P.bcs.map((b) => ({
+    id: ++bcSeq, type: b.type, name: b.name, dirs: b.dirs || [true, true, true], vector: b.vector || [0, 0, 0], p: b.p ?? 0,
+    faces: new Set(b.faces.filter(([pi]) => id(pi) !== undefined).map(([pi, fid]) => `${id(pi)}:${fid}`)),
+  }));
+  state.contacts = {};
+  for (const [k, v] of Object.entries(P.contacts || {})) {
+    const [a, b] = k.split('-').map((x) => id(+x));
+    if (a !== undefined && b !== undefined) state.contacts[`${Math.min(a, b)}-${Math.max(a, b)}`] = v;
+  }
+  const S = P.settings || {};
+  for (const [k, el] of [['meshMethod', 'meshMethod'], ['meshSize', 'meshSize'], ['anaType', 'anaType'], ['loadFactor', 'loadFactor'], ['nSteps', 'nSteps'], ['tol', 'tol'], ['bands', 'bands']])
+    if (S[k] !== undefined) $(el).value = S[k];
+  viewer.setColormap(colormap, +$('bands').value);
+  $('projName').value = P.name || file.name.replace(/\.[^.]+$/, '');
+  state.selectedPartId = ordered[0]?.id ?? null;
+  viewer.setParts(state.parts);
+  renderAll();
+  viewer.fit(new THREE.Vector3(1, -1.2, 0.9));
+  log(`已開啟專案：${file.name}（${ordered.length} 個零件、${state.bcs.length} 個邊界條件）`);
+}
+
+// ---------- PDF 報告 ----------
+/** 以指定視角／顯示量擷取 3D 畫面（淺色背景），完成後還原 */
+function captureView({ dir, resultType, mode }) {
+  const cam = viewer.camera, ctl = viewer.controls;
+  const saved = { pos: cam.position.clone(), target: ctl.target.clone(), up: cam.up.clone(), resultType: state.resultType, mode: state.mode };
+  const wasPlaying = state.anim.playing;
+  state.anim.playing = false;
+  if (mode) state.mode = mode;
+  if (resultType) { state.resultType = resultType; $('resType').value = resultType; }
+  if (dir) viewer.fit(dir);
+  repaint();
+  const legend = state.range ? { title: RES_LABEL[state.resultType], range: state.range, bands: +$('bands').value } : null;
+  const r = viewer.renderer, pr = r.getPixelRatio();
+  r.setPixelRatio(Math.max(2, pr));
+  viewer.resize();
+  ctl.update();
+  r.render(viewer.scene, cam);
+  const src = r.domElement;
+  const out = document.createElement('canvas');
+  out.width = src.width; out.height = src.height;
+  const g = out.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, out.height);
+  grad.addColorStop(0, '#5b6675'); grad.addColorStop(1, '#2a313b');
+  g.fillStyle = grad; g.fillRect(0, 0, out.width, out.height);
+  g.drawImage(src, 0, 0);
+  // 還原
+  r.setPixelRatio(pr);
+  viewer.resize();
+  cam.position.copy(saved.pos); cam.up.copy(saved.up); ctl.target.copy(saved.target); ctl.update();
+  state.resultType = saved.resultType; $('resType').value = saved.resultType;
+  state.mode = saved.mode;
+  repaint();
+  state.anim.playing = wasPlaying;
+  return { img: out, legend };
+}
+
+/** 將面板上的圖表（深色主題）複製到帶背景的 canvas */
+function chartImage(canvas) {
+  if (!canvas || canvas.hidden || !canvas.width) return null;
+  const out = document.createElement('canvas');
+  out.width = canvas.width; out.height = canvas.height;
+  const g = out.getContext('2d');
+  g.fillStyle = '#1b1f26'; g.fillRect(0, 0, out.width, out.height);
+  g.drawImage(canvas, 0, 0);
+  return out;
+}
+
+function reportData(name) {
+  const R = hasResults() ? state.results : null;
+  const s = R ? curStep() : null;
+  const massOf = (p) => { const kg = (p.volume * (p.material.rho || 0)) / 1e9; return p.material.rho ? (kg >= 1 ? `${fmt(kg, 4)} kg` : `${fmt(kg * 1000, 4)} g`) : '—'; };
+  const faceName = (k) => { const [pid, fid] = k.split(':').map(Number); return `${partById(pid)?.name ?? '?'} 面#${fid + 1}`; };
+  const plastic = R ? R.stats.plastic : $('anaType').value === 'plastic';
+  const data = {
+    name,
+    date: new Date().toLocaleString('zh-TW', { hour12: false }),
+    parts: state.parts.map((p) => ({ name: p.name, cat: CATEGORIES[p.material.cat] || '自訂', material: p.material.name, E: p.material.E, nu: p.material.nu, sy: p.material.sy, mass: massOf(p) })),
+    mesh: state.mesh ? { type: MESH_NAME[state.mesh.type], size: state.mesh.size, elems: state.mesh.elemCount, nodes: state.mesh.nodeCount, quality: state.mesh.quality !== undefined ? state.mesh.quality.toFixed(2) : undefined } : null,
+    bcs: state.bcs.map((b) => ({
+      name: b.name, type: BC_LABEL[b.type], faces: [...b.faces].map(faceName).join('、') || '（未選面）',
+      value: b.type === 'force' ? `(${b.vector.map((v) => fmt(v)).join(', ')}) N` : b.type === 'pressure' ? `${fmt(b.p)} MPa` : bcDesc(b),
+    })),
+    contacts: (state.mesh?.interfaces || []).map((I) => ({ pair: `${state.parts[I.a]?.name} ↔ ${state.parts[I.b]?.name}`, area: I.area, type: CONTACT_TYPES[contactType(I)] })),
+    analysis: {
+      typeLabel: plastic ? '非線性靜力（彈塑性）' : '線性靜力',
+      kv: [
+        ['分析類型', plastic ? '非線性靜力（J2 彈塑性）' : '線性靜力（線彈性）'],
+        ['負載倍率', $('loadFactor').value],
+        ...(plastic ? [['負載步數', $('nSteps').value]] : []),
+        ['線性求解容許誤差', $('tol').value],
+        ['單位制', 'mm、N、MPa'],
+      ],
+    },
+    results: null, images: [], charts: [],
+  };
+  if (R) {
+    const cols = [{ label: '零件', w: 2.4 }, { label: '最大 σvm [MPa]', w: 1.5, align: 'right' }, { label: '最大位移 [mm]', w: 1.5, align: 'right' }, { label: plastic ? '最大 PEEQ' : '安全係數', w: 1.3, align: 'right' }];
+    const rows = R.partElems.map((ne, i) => {
+      const p = state.parts[i];
+      if (!ne) return [p.name, '未計算', '', ''];
+      const vm = s.partMaxVM[i];
+      let last;
+      if (plastic) { const pe = s.partMaxPE[i]; last = { t: pe > 0 ? pe.toExponential(2) : '0（彈性）', color: pe > 0.02 ? '#c0392b' : pe > 0 ? '#c27c0e' : '#1e8a4f' }; }
+      else { const sf = p.material.sy / vm; last = { t: sf > 1e4 ? '>9999' : fmt(sf, 3), color: sf < 1 ? '#c0392b' : sf < 1.5 ? '#c27c0e' : '#1e8a4f' }; }
+      return [p.name, fmt(vm, 4), fmt(s.partMaxU[i], 4), last];
+    });
+    const notes = [
+      `總負載 (${R.totalLoad.map((v) => fmt(v)).join(', ')}) N${R.steps.length > 1 ? `，顯示負載步 ${state.step + 1}/${R.steps.length}（λ = ${fmt(s.lambda)}）` : ''}`,
+      `${R.stats.type.toUpperCase()}・元素 ${R.stats.elements.toLocaleString()}・自由度 ${R.stats.dofs.toLocaleString()}・求解 ${R.stats.seconds.toFixed(1)} s`,
+      ...(R.contact ? [`介面節點閉合 ${R.contact.closed}/${R.contact.springs}，最大穿透 ${fmt(R.contact.maxPen)} mm`] : []),
+      ...(plastic ? [] : ['安全係數 = 降伏強度 / 最大 von Mises 應力（<1 紅、<1.5 橘）']),
+    ];
+    data.results = { cols, rows, notes, warnings: R.warnings || [] };
+  }
+  return data;
+}
+
+async function exportPdf() {
+  if (!state.parts.length) return alert('目前沒有模型可輸出');
+  let pages = 0, kb = 0;
+  const build = async (name) => {
+    const data = reportData(name);
+    const iso = new THREE.Vector3(1, -1.2, 0.9), front = new THREE.Vector3(0, -1, 0);
+    if (hasResults()) {
+      const lam = state.results.steps.length > 1 ? `（λ = ${fmt(curStep().lambda)}）` : '';
+      const shots = [
+        ['vm', iso, `圖 1　von Mises 應力分布（等角視圖）${lam}`],
+        ['umag', iso, `圖 2　總位移分布（等角視圖，變形放大 ${fmt(state.deformScale)} 倍）`],
+        ['vm', front, '圖 3　von Mises 應力分布（前視圖）'],
+      ];
+      if (state.results.stats.plastic) shots.push(['pe', iso, '圖 4　等效塑性應變 PEEQ']);
+      for (const [rt, dir, cap] of shots) { const c = captureView({ dir, resultType: rt, mode: 'result' }); data.images.push({ img: c.img, caption: cap, legend: c.legend }); }
+      const ld = chartImage($('ldChart'));
+      if (ld) data.charts.push({ img: ld, caption: '負載-位移曲線' });
+    } else {
+      const c = captureView({ dir: iso, mode: 'model' });
+      data.images.push({ img: c.img, caption: '模型與邊界條件（藍：固定，紅／橘：負載）' });
+    }
+    const ss = chartImage($('ssChart'));
+    if (ss) data.charts.push({ img: ss, caption: `應力-應變曲線：${partById(state.selectedPartId)?.material.name ?? ''}` });
+    const { buildReportPdf } = await import('./report.js');
+    const r = await buildReportPdf(data);
+    pages = r.pages; kb = r.blob.size / 1024;
+    return r.blob;
+  };
+  let name = null;
+  try {
+    name = await saveNamed({
+      title: '存 PDF 報告', def: `${projName()} 分析報告`, ext: '.pdf', mime: 'application/pdf', desc: 'PDF 報告',
+      hint: hasResults() ? '包含模型、設定、結果摘要與結果圖。' : '尚未有計算結果，報告將只包含模型與設定。',
+      makeBlob: async (n) => { let blob; await withBusy('產生 PDF 報告中…', async () => { blob = await build(n); }); if (!blob) throw new Error('PDF 產生失敗'); return blob; },
+    });
+  } catch (e) { log(`錯誤：${e.message}`, 'e'); }
+  if (name) log(`已輸出 PDF 報告：${safeFileName(name)}.pdf（${pages} 頁，${kb.toFixed(0)} KB）`);
+}
+
+$('btnSave').onclick = saveProject;
+$('btnPdf').onclick = exportPdf;
+$('fileProj').onchange = (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (f) withBusy('開啟專案中…', () => openProject(f));
+};
+window.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveProject(); }
+});
 
 // ---------- 動態展示 ----------
 function animPeriod() {
