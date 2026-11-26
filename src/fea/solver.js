@@ -523,7 +523,6 @@ export function solveStatic(mesh, setup, progress = () => {}) {
       warnings.push(`約 ${(stabRatio * 100).toFixed(0)}% 的負載由接觸穩定化彈簧承受：可滑動或可分離的零件缺乏足夠支撐（形成機構），結果不具物理意義。請增加拘束，或將相關介面改為「黏合」或「粗糙接觸」`);
     contact = { springs: nSpr, closed, maxPen, frozen: sprFrozen, stabRatio };
     if (sprFrozen) warnings.push('接觸狀態在迭代中來回變化，已於第 12 次迭代凍結；接觸邊界附近的結果請謹慎判讀');
-    if (contactNL && closed === 0) warnings.push('所有接觸面皆已分離，零件僅由穩定化彈簧支撐（位移結果無物理意義），請檢查負載方向或改用黏合／無分離');
   }
   const partElems = new Array(materials.length).fill(0);
   for (const e of act) partElems[elemPart[e]]++;

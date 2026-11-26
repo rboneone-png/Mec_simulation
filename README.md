@@ -22,6 +22,8 @@ npm run build    # 輸出到 dist/
 | 分析 | 線性靜力；**非線性靜力（J2 彈塑性、等向硬化）**：Newton-Raphson、負載增量、自動減步 |
 | 結果顯示 | von Mises、位移、PEEQ；逐像素色帶（連續或分段等值線）、剖面（X/Y/Z 任意位置，剖切面顯示內部應力）、最大／最小值標示、網格線、高畫質模式 |
 | 動態展示 | 變形動畫（往返／單向）、負載步播放、速度調整、錄製 WebM 影片 |
+| 專案檔 | 儲存／開啟 `.mecsim`（含 STEP 幾何、材料、邊界條件、零件結合與設定），可自訂名稱；Ctrl+S 快速儲存 |
+| PDF 報告 | 自訂名稱；含模型與材料、網格、邊界條件、零件結合、分析設定、結果摘要（安全係數／PEEQ、警告）、結果圖（應力、位移、前視圖、PEEQ）與圖表 |
 | 其他 | 負載-位移曲線、安全係數、CSV／PNG 匯出 |
 
 ## 求解方法
@@ -67,6 +69,7 @@ npm run build    # 輸出到 dist/
 | three.js | 3D 顯示 | MIT |
 | occt-import-js（OpenCascade） | STEP 匯入 | LGPL-2.1 + OCCT 例外條款 |
 | float-tetwild-wasm（fTetWild、Geogram） | 四面體網格 | MPL-2.0、BSD-3 |
+| jsPDF | PDF 報告 | MIT |
 | Vite | 建置工具（不隨網站發佈） | MIT |
 
 MPL-2.0 為「檔案層級」的著作權條款：直接使用、未修改 fTetWild 本身，不影響你自己程式碼的授權；只有修改 fTetWild 原始檔時，需要公開那些修改。

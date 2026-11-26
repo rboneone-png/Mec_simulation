@@ -9,7 +9,12 @@
 <body>
   <header class="topbar">
     <div class="brand">MecSim <span>結構分析・線性／彈塑性</span></div>
+    <input id="projName" class="proj-name" type="text" value="未命名專案" title="專案名稱（儲存與報告的預設檔名）" />
     <div class="top-actions">
+      <label class="btn ghost" title="開啟 .mecsim 專案檔">📂 開啟<input id="fileProj" type="file" accept=".mecsim,.json" hidden /></label>
+      <button id="btnSave" class="btn ghost" title="儲存專案（Ctrl+S）">💾 儲存</button>
+      <button id="btnPdf" class="btn ghost" title="匯出 PDF 報告">📄 存 PDF</button>
+      <span class="tb-sep"></span>
       <label class="btn">匯入 STEP<input id="fileStep" type="file" accept=".step,.stp" multiple hidden /></label>
       <button id="btnDemo" class="btn ghost">載入示範組合件</button>
       <button id="btnClear" class="btn ghost">清除</button>
@@ -170,6 +175,19 @@
       <div class="busy" id="busy" hidden><div class="spinner"></div><span id="busyTxt">處理中…</span></div>
     </section>
   </main>
+  <div id="nameDlg" class="modal" hidden>
+    <form class="dlg" id="nameForm">
+      <h4 id="dlgTitle">儲存</h4>
+      <label>檔案名稱
+        <div class="name-row"><input id="dlgName" type="text" required /><span id="dlgExt"></span></div>
+      </label>
+      <div class="dlg-hint" id="dlgHint"></div>
+      <div class="btn-row dlg-btns">
+        <button type="button" class="btn ghost" id="dlgCancel">取消</button>
+        <button type="submit" class="btn" id="dlgOk">確定</button>
+      </div>
+    </form>
+  </div>
   <script type="module" src="./src/main.js"></script>
 </body>
 </html>
