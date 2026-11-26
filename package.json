@@ -1,0 +1,31 @@
+{
+  "name": "mec_simulation",
+  "version": "1.0.0",
+  "description": "應力應變模擬",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/cantilever.test.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rboneone-png/Mec_simulation.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/rboneone-png/Mec_simulation/issues"
+  },
+  "homepage": "https://github.com/rboneone-png/Mec_simulation#readme",
+  "dependencies": {
+    "occt-import-js": "^0.0.23",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.7"
+  },
+  "type": "module"
+}

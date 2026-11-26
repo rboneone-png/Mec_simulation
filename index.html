@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MecSim 應力應變模擬</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">MecSim <span>線彈性結構分析</span></div>
+    <div class="top-actions">
+      <label class="btn">匯入 STEP<input id="fileStep" type="file" accept=".step,.stp" multiple hidden /></label>
+      <button id="btnDemo" class="btn ghost">載入示範組合件</button>
+      <button id="btnClear" class="btn ghost">清除</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel" id="panel">
+      <section>
+        <h3>零件 <small id="partCount"></small></h3>
+        <div id="partList" class="list"><div class="empty">尚未載入模型。請匯入 STEP 檔或載入示範組合件。</div></div>
+      </section>
+
+      <section id="matSection" hidden>
+        <h3>材料 <small id="matPartName"></small></h3>
+        <div class="grid2">
+          <label class="full">材料庫<select id="matKey"></select></label>
+          <label>E 楊氏模數 [GPa]<input id="matE" type="number" step="any" /></label>
+          <label>ν 蒲松比<input id="matNu" type="number" step="0.01" min="0" max="0.49" /></label>
+          <label>σy 降伏強度 [MPa]<input id="matSy" type="number" step="any" /></label>
+          <label>σu 抗拉強度 [MPa]<input id="matSu" type="number" step="any" /></label>
+        </div>
+        <canvas id="ssChart" class="chart"></canvas>
+      </section>
+
+      <section>
+        <h3>邊界條件</h3>
+        <div class="btn-row">
+          <button class="btn sm" data-add="fixed">＋ 固定約束</button>
+          <button class="btn sm" data-add="force">＋ 力</button>
+          <button class="btn sm" data-add="pressure">＋ 壓力</button>
+        </div>
+        <div id="bcList" class="list"></div>
+        <div id="bcEditor" class="bc-editor" hidden></div>
+      </section>
+
+      <section>
+        <h3>網格與求解</h3>
+        <div class="grid2">
+          <label class="full">網格解析度（最長邊元素數）<span class="val" id="resVal"></span>
+            <input id="resolution" type="range" min="16" max="120" step="2" value="48" /></label>
+          <label>收斂容許誤差<select id="tol"><option value="1e-5">1e-5</option><option value="1e-6" selected>1e-6</option><option value="1e-7">1e-7</option></select></label>
+          <label>元素尺寸 h<span class="readout" id="hVal">—</span></label>
+        </div>
+        <button id="btnRun" class="btn primary block">▶ 執行模擬</button>
+        <div class="progress" id="progress" hidden><div class="bar"></div><span class="txt"></span></div>
+        <div id="log" class="log"></div>
+      </section>
+
+      <section id="resSection" hidden>
+        <h3>結果</h3>
+        <div class="grid2">
+          <label class="full">顯示量<select id="resType">
+            <option value="vm">von Mises 應力 [MPa]</option>
+            <option value="umag">總位移 [mm]</option>
+            <option value="ux">位移 Ux [mm]</option>
+            <option value="uy">位移 Uy [mm]</option>
+            <option value="uz">位移 Uz [mm]</option>
+          </select></label>
+          <label class="check"><input id="showDeform" type="checkbox" checked /> 顯示變形</label>
+          <label>變形放大倍率<input id="deformScale" type="number" step="any" /></label>
+        </div>
+        <table class="stats" id="statsTable"></table>
+        <div class="btn-row">
+          <button id="btnShot" class="btn sm ghost">截圖 PNG</button>
+          <button id="btnCsv" class="btn sm ghost">匯出 CSV</button>
+        </div>
+      </section>
+    </aside>
+
+    <div class="splitter" id="splitter"></div>
+
+    <section class="viewport">
+      <div class="view-toolbar">
+        <div class="seg" id="modeSeg">
+          <button data-mode="model" class="on">模型</button>
+          <button data-mode="result" disabled>結果</button>
+        </div>
+        <div class="seg">
+          <button data-view="fit" title="適合視窗">⤢</button>
+          <button data-view="iso">等角</button>
+          <button data-view="front">前</button>
+          <button data-view="right">右</button>
+          <button data-view="top">上</button>
+        </div>
+        <label class="check small"><input id="showEdges" type="checkbox" checked /> 邊線</label>
+      </div>
+      <div id="canvasHost" class="canvas-host"></div>
+      <div id="pickHint" class="pick-hint" hidden></div>
+      <div id="legend" class="legend" hidden>
+        <div class="legend-title" id="legendTitle"></div>
+        <div class="legend-body"><div class="legend-bar" id="legendBar"></div><div class="legend-ticks" id="legendTicks"></div></div>
+      </div>
+      <div class="statusbar" id="status">就緒</div>
+      <div class="busy" id="busy" hidden><div class="spinner"></div><span id="busyTxt">處理中…</span></div>
+    </section>
+  </main>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
