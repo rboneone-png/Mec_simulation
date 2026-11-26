@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <div class="brand">MecSim <span>結構分析・線性／彈塑性</span></div>
-    <div class="seg page-tabs" id="pageTabs"><button data-page="fea" class="on">🧊 結構模擬</button><button data-page="ins">📌 插入力計算</button></div>
+    <div class="seg page-tabs" id="pageTabs"><button data-page="fea" class="on">🧊 結構模擬</button><button data-page="ins3d">📌 插入模擬</button><button data-page="ins">🧮 解析估算</button></div>
     <input id="projName" class="proj-name" type="text" value="未命名專案" title="專案名稱（儲存與報告的預設檔名）" />
     <div class="top-actions">
       <label class="btn ghost" title="開啟 .mecsim 專案檔">📂 開啟<input id="fileProj" type="file" accept=".mecsim,.json" hidden /></label>
@@ -48,7 +48,27 @@
         <canvas id="ssChart" class="chart"></canvas>
       </section>
 
-      <section>
+      <section class="ins3d-only" id="insSetup">
+        <h3>插入／拔出設定</h3>
+        <div class="grid2">
+          <label class="full">模擬類型<div class="seg seg-sm" id="ins3Mode"><button data-m="insert" class="on">插入力（壓入）</button><button data-m="pull">拔出力（拔出）</button></div></label>
+          <label class="full">插入件（移動的零件）<select id="ins3Part"></select></label>
+          <label class="full">插入方向（拔出時反向移動）
+            <div class="dir-row"><div class="seg seg-sm" id="ins3Dir"><button data-d="0,0,-1">−Z</button><button data-d="0,0,1">+Z</button><button data-d="-1,0,0">−X</button><button data-d="1,0,0">+X</button><button data-d="0,-1,0">−Y</button><button data-d="0,1,0">+Y</button></div><button class="btn sm ghost" id="ins3Auto" title="依零件位置自動判斷方向與行程">自動</button></div>
+          </label>
+          <label>插入行程 S [mm]<input id="ins3Stroke" type="number" step="any" min="0" /></label>
+          <label>行程分段數<input id="ins3Steps" type="number" step="1" min="4" max="200" value="30" /></label>
+          <label class="full ins-only-row">CAD 中插入件的位置<select id="ins3Start">
+            <option value="final">插入完成位置（自動退回一個行程作為起點）</option>
+            <option value="start">插入起點（由此位置往前推一個行程）</option>
+          </select></label>
+          <label>摩擦係數 μ<input id="ins3Mu" type="number" step="0.01" min="0" max="2" value="0.2" /></label>
+          <label>參考值<select id="ins3MuPreset"></select></label>
+        </div>
+        <div class="note" style="color:var(--text-dim)">插入件沿方向強制推進（推動面：可於邊界條件加「推動面」，未設定則取插入件尾端）；被插入件需設「固定約束」（未設定則自動固定前端）。零件之間以點對面接觸計算，含摩擦與材料應力-應變（選「彈塑性」）。拔出力：CAD 需為組裝完成位置，插入件沿插入方向的反向拔出。插入模擬固定使用 TET10 網格（曲面誤差 &lt; 0.001 mm，干涉量才算得準）。</div>
+      </section>
+
+      <section class="fea-sim-only">
         <h3>零件結合</h3>
         <div id="contactBox" class="empty">產生網格後會自動偵測互相接觸的零件。</div>
       </section>
@@ -57,8 +77,9 @@
         <h3>邊界條件</h3>
         <div class="btn-row">
           <button class="btn sm" data-add="fixed">＋ 固定約束</button>
-          <button class="btn sm" data-add="force">＋ 力</button>
-          <button class="btn sm" data-add="pressure">＋ 壓力</button>
+          <button class="btn sm fea-sim-only" data-add="force">＋ 力</button>
+          <button class="btn sm fea-sim-only" data-add="pressure">＋ 壓力</button>
+          <button class="btn sm ins3d-only" data-add="push">＋ 推動面</button>
         </div>
         <div id="bcList" class="list"></div>
         <div id="bcEditor" class="bc-editor" hidden></div>
@@ -67,7 +88,8 @@
       <section>
         <h3>網格</h3>
         <div class="grid2">
-          <label class="full">網格方法<select id="meshMethod">
+          <div class="full ins3d-only mesh-ins-note">插入／拔出模擬固定使用 <b>TET10 四面體</b>（各零件獨立網格，曲面貼合 CAD）</div>
+          <label class="full fea-sim-only">網格方法<select id="meshMethod">
             <option value="hex20">六面體 HEX20（貼體二次元素，建議）</option>
             <option value="hex8">六面體 HEX8（貼體一次元素）</option>
             <option value="tet">四面體 TET10（fTetWild）</option>
@@ -85,8 +107,8 @@
             <option value="linear">線性靜力（線彈性）</option>
             <option value="plastic">非線性靜力（彈塑性 J2，等向硬化）</option>
           </select></label>
-          <label>負載倍率<input id="loadFactor" type="number" step="any" min="0" value="1" /></label>
-          <label class="plastic-only">負載步數<input id="nSteps" type="number" step="1" min="1" max="100" value="10" /></label>
+          <label class="fea-sim-only">負載倍率<input id="loadFactor" type="number" step="any" min="0" value="1" /></label>
+          <label class="plastic-only fea-sim-only">負載步數<input id="nSteps" type="number" step="1" min="1" max="100" value="10" /></label>
           <label>線性求解容許誤差<select id="tol"><option value="1e-5">1e-5</option><option value="1e-6" selected>1e-6</option><option value="1e-7">1e-7</option></select></label>
         </div>
         <div class="btn-row" style="margin-top:10px">
@@ -107,6 +129,7 @@
             <option value="uy">位移 Uy [mm]</option>
             <option value="uz">位移 Uz [mm]</option>
             <option value="pe">等效塑性應變 PEEQ</option>
+            <option value="cp">接觸壓力 [MPa]</option>
           </select></label>
           <label class="full step-row" id="stepRow">負載步 <span class="val" id="stepVal"></span><input id="stepSlider" type="range" min="0" max="0" step="1" value="0" /></label>
           <label class="check"><input id="showDeform" type="checkbox" checked /> 顯示變形</label>

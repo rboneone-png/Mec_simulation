@@ -196,3 +196,15 @@ body.ins-press .snap-only, body.ins-snap .press-only { display: none !important;
 .method { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
 .method b { color: var(--text); }
 @media (max-width: 760px) { .ins-view { grid-template-columns: 1fr; padding: 10px; } .page-tabs button { padding: 5px 8px; } }
+
+/* 插入模擬（3D） */
+body.ins-pull .ins-only-row { display: none !important; }
+body:not(.sim-insert) .ins3d-only, body.sim-insert .fea-sim-only { display: none !important; }
+.dir-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.dir-row .seg button { padding: 3px 8px; }
+.tag.push { background: color-mix(in srgb, #2fbf71 25%, transparent); color: #7fe0a8; }
+.ins-kpi { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
+.ins-kpi div { background: var(--panel-2); border-radius: 6px; padding: 6px 8px; font-size: 11px; color: var(--text-dim); }
+.ins-kpi b { display: block; font-size: 16px; color: var(--text); font-variant-numeric: tabular-nums; }
+.mesh-ins-note { font-size: 11px; color: var(--text-dim); }
+.mesh-ins-note b { color: var(--text); }

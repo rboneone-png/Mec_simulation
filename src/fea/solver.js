@@ -4,8 +4,13 @@ import { ELEMENTS, precomputeGeometry } from './elements.js';
 import { updateJ2, elasticD, hardeningTable, vonMises } from './plasticity.js';
 
 /** 依節點相鄰關係建立 3×3 區塊 CSR */
-function buildCSR(nNode, elems, nen, act, springs) {
+function buildCSR(nNode, elems, nen, act, springs, extra) {
   const nbr = Array.from({ length: nNode }, () => null);
+  if (extra)
+    for (let q = 0; q < extra.a.length; q++) {
+      const a = extra.a[q], b = extra.b[q];
+      for (const [i, j] of [[a, a], [a, b], [b, a], [b, b]]) { let s2 = nbr[i]; if (!s2) s2 = nbr[i] = new Set(); s2.add(j); }
+    }
   if (springs)
     for (let q = 0; q < springs.a.length; q++) {
       const a = springs.a[q], b = springs.b[q];
@@ -49,7 +54,7 @@ function buildCSR(nNode, elems, nen, act, springs) {
     const a = springs.a[q], b = springs.b[q];
     spBlk[4 * q] = find(a, a); spBlk[4 * q + 1] = find(a, b); spBlk[4 * q + 2] = find(b, a); spBlk[4 * q + 3] = find(b, b);
   }
-  return { rowPtr, col, val: new Float64Array(9 * col.length), blk, spBlk };
+  return { rowPtr, col, val: new Float64Array(9 * col.length), blk, spBlk, find };
 }
 
 function csrMul(A, x, y, free) {
@@ -208,6 +213,46 @@ function pcg(A, b, x, free, tol, maxIter, onIter, precIn) {
   return { iterations: it, residual: rel };
 }
 
+/** 前置條件 BiCGSTAB（非對稱系統：滑動摩擦的切線矩陣） */
+function bicgstab(A, b, x, free, tol, maxIter, onIter, precIn) {
+  const n = b.length;
+  const prec = precIn || makePreconditioner(A, free);
+  const r = new Float64Array(n), r0 = new Float64Array(n), p = new Float64Array(n), v = new Float64Array(n);
+  const s = new Float64Array(n), t = new Float64Array(n), ph = new Float64Array(n), sh = new Float64Array(n);
+  const dot = (a, c) => { let q = 0; for (let i = 0; i < n; i++) q += a[i] * c[i]; return q; };
+  csrMul(A, x, v, free);
+  for (let i = 0; i < n; i++) r[i] = free[i] ? b[i] - v[i] : 0;
+  r0.set(r);
+  const bn = Math.sqrt(dot(b, b)) || 1;
+  let rho = 1, alpha = 1, omega = 1, it = 0, rel = Math.sqrt(dot(r, r)) / bn;
+  v.fill(0); p.fill(0);
+  while (it < maxIter && rel > tol) {
+    const rhoN = dot(r0, r);
+    if (!Number.isFinite(rhoN) || rhoN === 0) break;
+    const beta = (rhoN / rho) * (alpha / omega);
+    rho = rhoN;
+    for (let i = 0; i < n; i++) p[i] = r[i] + beta * (p[i] - omega * v[i]);
+    prec(p, ph);
+    csrMul(A, ph, v, free);
+    const r0v = dot(r0, v);
+    if (!(Math.abs(r0v) > 0)) break;
+    alpha = rho / r0v;
+    for (let i = 0; i < n; i++) s[i] = r[i] - alpha * v[i];
+    if (Math.sqrt(dot(s, s)) / bn < tol) { for (let i = 0; i < n; i++) x[i] += alpha * ph[i]; r.set(s); it++; break; }
+    prec(s, sh);
+    csrMul(A, sh, t, free);
+    const tt = dot(t, t);
+    omega = tt > 0 ? dot(t, s) / tt : 0;
+    for (let i = 0; i < n; i++) { x[i] += alpha * ph[i] + omega * sh[i]; r[i] = s[i] - omega * t[i]; }
+    it++;
+    rel = Math.sqrt(dot(r, r)) / bn;
+    if (it % 10 === 0) onIter?.(it, rel);
+    if (omega === 0) break;
+  }
+  rel = Math.sqrt(dot(r, r)) / bn;
+  return { iterations: it, residual: rel };
+}
+
 /**
  * mesh  = { type, nodes: Float64Array, elems: Int32Array, elemPart: Int32Array }
  * setup = { materials:[{E,nu,sy,su,eu,name}], plastic, steps, loadFactor, fixed: Uint8Array(nDof), F: Float64Array(nDof), tol }
@@ -226,8 +271,11 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   const nSpr = springs ? springs.a.length : 0;
   const plastic = !!setup.plastic;
   const contactNL = !!springs && springs.type.some((t) => t >= 2);
-  const nonlinear = plastic || contactNL;
-  const nSteps = plastic ? Math.max(1, setup.steps | 0) : 1;
+  // 插入模擬：drive = { push: 推動節點, body: 移動件節點遮罩(Uint8Array), d0, d1: 起點／終點平移向量 }
+  const drive = setup.drive || null;
+  const nts = setup.nts || null;
+  const nonlinear = plastic || contactNL || !!drive || !!nts;
+  const nSteps = plastic || drive ? Math.max(1, setup.steps | 0) : 1;
   const loadFactor = setup.loadFactor ?? 1;
   const linTol = setup.tol ?? 1e-6;
 
@@ -242,6 +290,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   for (let q = 0; q < nSpr; q++) { const ra = find(springs.a[q]), rb = find(springs.b[q]); if (ra !== rb) parent[rb] = ra; }
   const anchored = new Set();
   for (let n = 0; n < nNode; n++) if (fixed[3 * n] || fixed[3 * n + 1] || fixed[3 * n + 2]) anchored.add(find(n));
+  if (drive) for (const n of drive.push) anchored.add(find(n));
   if (!anchored.size) throw new Error('至少需要一個「固定約束」才能求解');
   const act = [];
   const dropped = new Set();
@@ -254,6 +303,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   for (const e of act) for (let a = 0; a < nen; a++) used[elems[e * nen + a]] = 1;
   const free = new Uint8Array(nDof);
   for (let n = 0; n < nNode; n++) if (used[n]) for (let d = 0; d < 3; d++) free[3 * n + d] = fixed[3 * n + d] ? 0 : 1;
+  if (drive) for (const n of drive.push) for (let d = 0; d < 3; d++) free[3 * n + d] = 0;
   const Fe = new Float64Array(nDof);
   for (let d = 0; d < nDof; d++) Fe[d] = free[d] ? F[d] : 0;
 
@@ -268,7 +318,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   }));
 
   progress({ stage: '建立稀疏矩陣', frac: 0.05 });
-  const A = buildCSR(nNode, elems, nen, act, springs);
+  let A = buildCSR(nNode, elems, nen, act, springs);
 
   // --- 狀態 ---
   const nGp = nA * ng;
@@ -288,6 +338,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   const sprSliding = new Uint8Array(nSpr);
   let sprChanges = 0, sprFrozen = false;
   const STAB = 1e-6; // 穩定化勁度比例（僅防止剛體模態，不應承受實質負載）
+  let ntsChanges = 0;
   const assemble = (u, wantK, updateContact = false) => {
     if (updateContact) sprChanges = 0;
     const fint = new Float64Array(nDof);
@@ -407,11 +458,21 @@ export function solveStatic(mesh, setup, progress = () => {}) {
       const [aa, ab, ba, bb] = [A.spBlk[4 * q], A.spBlk[4 * q + 1], A.spBlk[4 * q + 2], A.spBlk[4 * q + 3]];
       for (let i = 0; i < 9; i++) { A.val[9 * aa + i] += K[i]; A.val[9 * bb + i] += K[i]; A.val[9 * ab + i] -= K[i]; A.val[9 * ba + i] -= K[i]; }
     }
+    // 點對面接觸（插入模擬）
+    if (nts) {
+      const addK = wantK ? (i, j, K9, c) => { if (!used[i] || !used[j]) return; const v = 9 * A.find(i, j); if (v < 0) return; for (let t = 0; t < 9; t++) A.val[v + t] += c * K9[t]; } : null;
+      ntsChanges = nts.assemble(u, fint, addK, updateContact);
+    }
     return fint;
   };
 
   const norm = (v) => { let s = 0; for (let i = 0; i < v.length; i++) if (free[i]) s += v[i] * v[i]; return Math.sqrt(s); };
   const Fn = norm(Fe) || 1;
+  // 插入模擬沒有外力：以內力大小作為殘差的參考尺度
+  const normAll = (v) => { let s = 0; for (let i = 0; i < v.length; i++) if (used[i / 3 | 0]) s += v[i] * v[i]; return Math.sqrt(s); };
+  const ref0 = drive ? 1e-6 * Math.max(...materials.map((m) => m.E)) * (setup.h || 1) ** 2 : 0;
+  const dirU = drive ? (() => { const d = [drive.d1[0] - drive.d0[0], drive.d1[1] - drive.d0[1], drive.d1[2] - drive.d0[2]]; const l = Math.hypot(...d) || 1; return d.map((v) => v / l); })() : null;
+  const driveAt = (lam) => [0, 1, 2].map((d) => drive.d0[d] + lam * (drive.d1[d] - drive.d0[d]));
 
   // --- 節點後處理 ---
   const nodeOut = (u) => {
@@ -447,6 +508,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
 
   // --- 增量 Newton-Raphson ---
   const u = new Float64Array(nDof);
+  if (drive) for (let n = 0; n < nNode; n++) if (drive.body[n]) for (let d = 0; d < 3; d++) u[3 * n + d] = drive.d0[d];
   const steps = [];
   let lamDone = 0, totalNewton = 0, totalCG = 0, lastRes = 0;
   let dLam = loadFactor / nSteps, cuts = 0;
@@ -460,29 +522,42 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   while (k <= nSteps) {
     const lam = Math.min(lamDone + dLam, lamTarget(k));
     uSave.set(u);
+    if (drive) {
+      // 預測：移動件整體平移本步增量（推動面節點即為強制位移）
+      const a = driveAt(lamDone), b = driveAt(lam);
+      for (let n = 0; n < nNode; n++) if (drive.body[n]) for (let d = 0; d < 3; d++) u[3 * n + d] += b[d] - a[d];
+    }
+    if (nts) {
+      const inc = drive ? Math.hypot(...[0, 1, 2].map((d) => (drive.d1[d] - drive.d0[d]) * (lam - lamDone))) : 0;
+      const pr = nts.beginStep(uSave, inc + 0.5 * (setup.h || 1));
+      A = buildCSR(nNode, elems, nen, act, springs, pr);
+      prec = null;
+    }
     let converged = false, it = 0;
-    const maxIt = nonlinear ? (plastic ? 15 : 30) : 1;
+    const maxIt = nonlinear ? (drive ? 25 : plastic ? 15 : 30) : 1;
     let prevRn = Infinity;
     for (; it < maxIt; it++) {
       if (contactNL && it === 12) sprFrozen = true; // 迭代過多：凍結接觸狀態
-      const fint = assemble(u, true, contactNL);
+      if (nts && it === 4) nts.lockFaces();
+      if (nts && it === 8) nts.freeze();
+      const fint = assemble(u, true, contactNL || !!nts);
       const r = new Float64Array(nDof);
       for (let d = 0; d < nDof; d++) r[d] = free[d] ? lam * Fe[d] - fint[d] : 0;
-      const rn = norm(r) / (lam * Fn);
+      const rn = norm(r) / (drive ? Math.max(normAll(fint), ref0) : lam * Fn);
       lastRes = rn;
-      if (it > 0 && rn < nlTol && sprChanges === 0) { converged = true; break; }
+      if (it > 0 && rn < nlTol && sprChanges === 0 && ntsChanges === 0) { converged = true; break; }
       // 發散判斷：殘差非有限、暴增，或多次迭代後仍無明顯下降
       if (!Number.isFinite(rn) || (plastic && ((it > 2 && rn > 10 * prevRn) || (it >= 8 && rn > 1e-2)))) break;
       prevRn = rn;
       const du = new Float64Array(nDof);
       // 熱啟動：每步第一次迭代以前一步增量（依負載增量比例縮放）作為初始猜測
-      if (plastic && it === 0 && lastDLam > 0) { const sc = (lam - lamDone) / lastDLam; for (let d = 0; d < nDof; d++) du[d] = lastInc[d] * sc; }
+      if (plastic && !drive && it === 0 && lastDLam > 0) { const sc = (lam - lamDone) / lastDLam; for (let d = 0; d < nDof; d++) du[d] = lastInc[d] * sc; }
       // 非精確 Newton：線性求解容許誤差隨殘差調整（收斂仍以真實殘差判斷）
       const cgTol = nonlinear ? Math.min(1e-2, Math.max(linTol, (0.3 * nlTol) / Math.max(rn, 1e-12))) : linTol;
       const cgMax = plastic ? Math.max(3000, Math.round(Math.sqrt(nDof) * 40)) : 50000;
       // 前置條件：每個負載步只分解一次，Newton 迭代間重複使用（切線矩陣變化不大）
       if (it === 0 || !prec) prec = makePreconditioner(A, free);
-      const res = pcg(A, r, du, free, cgTol, cgMax, (ci, cr) =>
+      const res = (nts?.nonsymmetric ? bicgstab : pcg)(A, r, du, free, cgTol, cgMax, (ci, cr) =>
         progress({ stage: plastic ? `負載步 ${k}/${nSteps}・Newton ${it + 1}` : contactNL ? `接觸迭代 ${it + 1}` : '求解線性系統', frac: 0.08 + (0.85 * (lamDone + (lam - lamDone) * 0.5)) / loadFactor, iter: ci, residual: cr }), prec);
       totalCG += res.iterations;
       if (plastic && !(res.residual < Math.max(0.05, cgTol * 5))) break; // 切線矩陣近奇異（接近極限負載）
@@ -495,7 +570,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
       const fint = assemble(u, false);
       let s = 0;
       for (let d = 0; d < nDof; d++) if (free[d]) s += (lam * Fe[d] - fint[d]) ** 2;
-      lastRes = Math.sqrt(s) / (lam * Fn);
+      lastRes = Math.sqrt(s) / (drive ? Math.max(normAll(fint), ref0) : lam * Fn);
       converged = lastRes < nlTol * 10;
     }
     if (!converged) {
@@ -509,17 +584,33 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     [epsP, epsPN] = [epsPN, epsP];
     [alpha, alphaN] = [alphaN, alpha];
     if (nSpr) [sprSlip, sprSlipN] = [sprSlipN, sprSlip];
+    let ins = null;
+    if (drive) {
+      // 插入力：推動面節點的內力沿插入方向的合力；接觸統計
+      const fint = assemble(u, false);
+      let F = 0;
+      for (const n of drive.push) for (let d = 0; d < 3; d++) F += fint[3 * n + d] * dirU[d];
+      const sm = nts ? nts.summary(nNode) : null;
+      ins = { force: F, stroke: Math.hypot(...[0, 1, 2].map((d) => (drive.d1[d] - drive.d0[d]) * lam)), cp: sm?.cp, nAct: sm?.nAct || 0, nSlip: sm?.nSlip || 0, Fn: sm?.Fn || 0 };
+    }
+    if (nts) nts.commit();
     for (let d = 0; d < nDof; d++) lastInc[d] = u[d] - uSave[d];
     lastDLam = lam - lamDone;
     lamDone = lam;
     if (Math.abs(lam - lamTarget(k)) < 1e-12 * loadFactor) {
-      const o = nodeOut(u);
+      // 變形位移（移動件扣除剛體平移）
+      let uD = u;
+      const rigid = drive ? driveAt(lam) : null;
+      if (drive) { uD = Float64Array.from(u); for (let n = 0; n < nNode; n++) if (drive.body[n]) for (let d = 0; d < 3; d++) uD[3 * n + d] -= rigid[d]; }
+      const o = nodeOut(uD);
       let maxU = 0;
-      for (let n = 0; n < nNode; n++) if (used[n]) maxU = Math.max(maxU, Math.hypot(u[3 * n], u[3 * n + 1], u[3 * n + 2]));
+      for (let n = 0; n < nNode; n++) if (used[n]) maxU = Math.max(maxU, Math.hypot(uD[3 * n], uD[3 * n + 1], uD[3 * n + 2]));
       steps.push({
         lambda: lam, u: Float32Array.from(u), vm: o.vm, pe: o.pe,
         partMaxVM: Array.from(o.partMaxVM), partMaxU: Array.from(o.partMaxU), partMaxPE: Array.from(o.partMaxPE),
         maxU, maxVM: Math.max(...o.partMaxVM), maxPE: Math.max(...o.partMaxPE), newton: it,
+        ...(rigid ? { rigid } : {}),
+        ...(ins ? { insert: { force: ins.force, stroke: ins.stroke, nAct: ins.nAct, nSlip: ins.nSlip, Fn: ins.Fn }, cp: ins.cp } : {}),
       });
       k++;
       dLam = loadFactor / nSteps;
