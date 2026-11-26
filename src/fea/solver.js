@@ -283,6 +283,9 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   /** 由位移 u 計算內力（並視需要組裝切線勁度） */
   // 接觸狀態（1 = 閉合）：Newton 迭代間保留，避免開／閉來回震盪
   const sprState = new Uint8Array(nSpr).fill(1);
+  // 摩擦接觸的切向滑移量（已收斂／試探），與滑動狀態
+  let sprSlip = new Float64Array(nSpr * 3), sprSlipN = new Float64Array(nSpr * 3);
+  const sprSliding = new Uint8Array(nSpr);
   let sprChanges = 0, sprFrozen = false;
   const STAB = 1e-6; // 穩定化勁度比例（僅防止剛體模態，不應承受實質負載）
   const assemble = (u, wantK, updateContact = false) => {
@@ -360,15 +363,45 @@ export function solveStatic(mesh, setup, progress = () => {}) {
         if (ns !== sprState[q]) { sprState[q] = ns; sprChanges++; }
       }
       const closed = t === 1 || sprState[q] === 1;
-      const kn = closed ? k : k * STAB; // 分離時保留微小勁度（穩定化）
-      const kt = t === 3 && closed ? k : k * STAB; // 微小切向勁度：避免可滑動零件產生剛體模態
       const nn = [nx, ny, nz];
-      const K = new Float64Array(9);
-      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) K[3 * i + j] = (kn - kt) * nn[i] * nn[j] + (i === j ? kt : 0);
       const d = [dx, dy, dz];
-      for (let i = 0; i < 3; i++) {
-        const f = K[3 * i] * d[0] + K[3 * i + 1] * d[1] + K[3 * i + 2] * d[2];
-        fint[b + i] += f; fint[a + i] -= f;
+      const K = new Float64Array(9);
+      if (t === 4 && closed) {
+        // 庫倫摩擦（罰函數 + 回歸映射）：試探切向力 = k·(切向相對位移 − 已累積滑移)
+        const fn = k * Math.max(0, -g); // 法向壓力（正值）
+        const s0 = 3 * q, mu = springs.mu[q];
+        const tr = [0, 1, 2].map((i) => k * (d[i] - g * nn[i] - sprSlip[s0 + i]));
+        const trN = Math.hypot(tr[0], tr[1], tr[2]);
+        const limit = mu * fn;
+        let ft, ktEff, that = null;
+        if (trN <= limit || trN === 0) { ft = tr; ktEff = k; sprSliding[q] = 0; }
+        else {
+          // 滑動：切向力 = μ·fn·方向；切線勁度取對稱近似（忽略與法向力的耦合）
+          that = tr.map((v) => v / trN);
+          ft = that.map((v) => v * limit);
+          ktEff = (k * limit) / trN;
+          sprSliding[q] = 1;
+        }
+        for (let i = 0; i < 3; i++) sprSlipN[s0 + i] = d[i] - g * nn[i] - ft[i] / k;
+        for (let i = 0; i < 3; i++)
+          for (let j = 0; j < 3; j++) {
+            const P = (i === j ? 1 : 0) - nn[i] * nn[j];
+            const Tt = that ? that[i] * that[j] : 0;
+            K[3 * i + j] = k * nn[i] * nn[j] + ktEff * (P - Tt) + (that ? k * STAB * Tt : 0);
+          }
+        for (let i = 0; i < 3; i++) {
+          const f = k * g * nn[i] + ft[i];
+          fint[b + i] += f; fint[a + i] -= f;
+        }
+      } else {
+        const kn = closed ? k : k * STAB; // 分離時保留微小勁度（穩定化）
+        const kt = t === 3 && closed ? k : k * STAB; // 微小切向勁度：避免可滑動零件產生剛體模態
+        if (t === 4) { sprSliding[q] = 0; for (let i = 0; i < 3; i++) sprSlipN[3 * q + i] = sprSlip[3 * q + i]; }
+        for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) K[3 * i + j] = (kn - kt) * nn[i] * nn[j] + (i === j ? kt : 0);
+        for (let i = 0; i < 3; i++) {
+          const f = K[3 * i] * d[0] + K[3 * i + 1] * d[1] + K[3 * i + 2] * d[2];
+          fint[b + i] += f; fint[a + i] -= f;
+        }
       }
       if (!wantK) continue;
       const [aa, ab, ba, bb] = [A.spBlk[4 * q], A.spBlk[4 * q + 1], A.spBlk[4 * q + 2], A.spBlk[4 * q + 3]];
@@ -475,6 +508,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     // 收斂：提交狀態
     [epsP, epsPN] = [epsPN, epsP];
     [alpha, alphaN] = [alphaN, alpha];
+    if (nSpr) [sprSlip, sprSlipN] = [sprSlipN, sprSlip];
     for (let d = 0; d < nDof; d++) lastInc[d] = u[d] - uSave[d];
     lastDLam = lam - lamDone;
     lamDone = lam;
@@ -513,7 +547,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
       const closed = t === 1 || sprState[q] === 1;
       const tan = d.map((v, i) => v - g * n[i]);
       let f2 = 0;
-      if (!(t === 3 && closed)) f2 += (k * STAB) ** 2 * (tan[0] ** 2 + tan[1] ** 2 + tan[2] ** 2);
+      if (!((t === 3 || t === 4) && closed)) f2 += (k * STAB) ** 2 * (tan[0] ** 2 + tan[1] ** 2 + tan[2] ** 2);
       if (!closed) f2 += (k * STAB * g) ** 2;
       fStab += Math.sqrt(f2);
     }
@@ -521,7 +555,9 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     const stabRatio = fApplied > 0 ? fStab / fApplied : 0;
     if (stabRatio > 0.01)
       warnings.push(`約 ${(stabRatio * 100).toFixed(0)}% 的負載由接觸穩定化彈簧承受：可滑動或可分離的零件缺乏足夠支撐（形成機構），結果不具物理意義。請增加拘束，或將相關介面改為「黏合」或「粗糙接觸」`);
-    contact = { springs: nSpr, closed, maxPen, frozen: sprFrozen, stabRatio };
+    let sliding = 0;
+    for (let q = 0; q < nSpr; q++) if (springs.type[q] === 4 && sprState[q] === 1 && sprSliding[q]) sliding++;
+    contact = { springs: nSpr, closed, maxPen, frozen: sprFrozen, stabRatio, sliding };
     if (sprFrozen) warnings.push('接觸狀態在迭代中來回變化，已於第 12 次迭代凍結；接觸邊界附近的結果請謹慎判讀');
   }
   const partElems = new Array(materials.length).fill(0);

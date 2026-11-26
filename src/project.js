@@ -15,6 +15,11 @@ function fromBase64(b64) {
   return out;
 }
 
+const remapPairs = (obj, partIdx) => Object.fromEntries(Object.entries(obj).map(([k, v]) => {
+  const [a, b] = k.split('-').map(Number);
+  return [`${partIdx.get(a)}-${partIdx.get(b)}`, v];
+}).filter(([k]) => !k.includes('undefined')));
+
 /** 由程式狀態建立專案物件 */
 export function serializeProject(state, name, settings) {
   const usedFiles = [...new Set(state.parts.map((p) => p.fileIdx))].sort((a, b) => a - b);
@@ -33,10 +38,8 @@ export function serializeProject(state, name, settings) {
       type: b.type, name: b.name, dirs: b.dirs, vector: b.vector, p: b.p,
       faces: [...b.faces].map((k) => { const [pid, fid] = k.split(':').map(Number); return [partIdx.get(pid), fid]; }).filter(([pi]) => pi !== undefined),
     })),
-    contacts: Object.fromEntries(Object.entries(state.contacts).map(([k, v]) => {
-      const [a, b] = k.split('-').map(Number);
-      return [`${partIdx.get(a)}-${partIdx.get(b)}`, v];
-    }).filter(([k]) => !k.includes('undefined'))),
+    contacts: remapPairs(state.contacts, partIdx),
+    contactMu: remapPairs(state.contactMu || {}, partIdx),
     settings,
   };
 }

@@ -163,3 +163,6 @@ body:not(.plastic) .plastic-only { display: none !important; }
 .dlg-hint { font-size: 11px; color: var(--text-dim); margin-top: 8px; min-height: 14px; }
 .dlg-btns { justify-content: flex-end; margin: 16px 0 0; }
 @media (max-width: 760px) { .proj-name { display: none; } }
+
+.mu-row { grid-column: 1 / -1; display: grid; grid-template-columns: 110px 1fr; gap: 6px; align-items: end; }
+.mu-row label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--text-dim); }
