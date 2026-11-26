@@ -2,9 +2,10 @@ import * as THREE from 'three';
 import { Viewer } from './viewer.js';
 import { loadStep } from './importers.js';
 import { MATERIALS, CATEGORIES, cloneMaterial } from './materials.js';
-import { CONTACT_TYPES, DEFAULT_MU } from './fea/contact.js';
+import { CONTACT_TYPES, DEFAULT_MU, MU_PRESETS } from './fea/contact.js';
 import { serializeProject, parseProject, safeFileName, saveBlob, PROJECT_EXT, hasSavePicker, saveWithPicker } from './project.js';
 import { colormap, colormapCss, drawStressStrain, drawCurve, fmt } from './plots.js';
+import { initInsertion, draw as drawInsertion, getInsertionState, setInsertionState, insertionReportData } from './insertion-ui.js';
 
 const $ = (id) => document.getElementById(id);
 const BC_LABEL = { fixed: '固定約束', force: '力', pressure: '壓力' };
@@ -767,11 +768,6 @@ const contactType = (I) => state.contacts[pairKey(I)] || 'bonded';
 const contactMu = (I) => state.contactMu[pairKey(I)] ?? DEFAULT_MU;
 const contactLabel = (I) => CONTACT_TYPES[contactType(I)] + (contactType(I) === 'frictional' ? `，μ = ${contactMu(I)}` : '');
 // 常見材料組合的靜摩擦係數（典型值，實際依表面處理、潤滑而異）
-const MU_PRESETS = [
-  ['鋼–鋼（乾燥、一般加工面）', 0.3], ['鋼–鋼（潤滑）', 0.1], ['鋼–鋼（噴砂／粗糙面）', 0.5],
-  ['鋁–鋼', 0.45], ['鋁–鋁（乾燥）', 0.5], ['銅–鋼', 0.5], ['鑄鐵–鋼', 0.2],
-  ['工程塑膠（POM／PA）–鋼', 0.2], ['PTFE–鋼', 0.05], ['橡膠–鋼', 0.8],
-];
 
 function renderContacts() {
   const box = $('contactBox');
@@ -1010,15 +1006,16 @@ function currentSettings() {
   return {
     meshMethod: $('meshMethod').value, meshSize: $('meshSize').value, anaType: $('anaType').value,
     loadFactor: $('loadFactor').value, nSteps: $('nSteps').value, tol: $('tol').value, bands: $('bands').value,
+    page: state.page, insertion: getInsertionState(),
   };
 }
 
 async function saveProject() {
-  if (!state.parts.length) return alert('目前沒有模型可儲存');
+  if (!state.parts.length && state.page !== 'ins') return alert('目前沒有模型可儲存');
   let size = 0;
   const name = await saveNamed({
     title: '儲存專案', def: projName(), ext: PROJECT_EXT, mime: 'application/json', desc: 'MecSim 專案檔',
-    hint: '包含 STEP 幾何、材料、邊界條件、零件結合與分析設定（不含計算結果）。',
+    hint: '包含 STEP 幾何、材料、邊界條件、零件結合、分析設定與插入力計算參數（不含計算結果）。',
     makeBlob: (n) => { const json = JSON.stringify(serializeProject(state, n, currentSettings())); size = json.length; return new Blob([json], { type: 'application/json' }); },
   });
   if (!name) return;
@@ -1063,11 +1060,13 @@ async function openProject(file) {
   for (const [k, el] of [['meshMethod', 'meshMethod'], ['meshSize', 'meshSize'], ['anaType', 'anaType'], ['loadFactor', 'loadFactor'], ['nSteps', 'nSteps'], ['tol', 'tol'], ['bands', 'bands']])
     if (S[k] !== undefined) $(el).value = S[k];
   viewer.setColormap(colormap, +$('bands').value);
+  if (S.insertion) setInsertionState(S.insertion);
+  if (S.page) setPage(S.page);
   $('projName').value = P.name || file.name.replace(/\.[^.]+$/, '');
   state.selectedPartId = ordered[0]?.id ?? null;
   viewer.setParts(state.parts);
   renderAll();
-  viewer.fit(new THREE.Vector3(1, -1.2, 0.9));
+  if (ordered.length) viewer.fit(new THREE.Vector3(1, -1.2, 0.9));
   log(`已開啟專案：${file.name}（${ordered.length} 個零件、${state.bcs.length} 個邊界條件）`);
 }
 
@@ -1168,7 +1167,31 @@ function reportData(name) {
   return data;
 }
 
+async function exportInsertionPdf() {
+  let pages = 0, kb = 0, name = null;
+  try {
+    name = await saveNamed({
+      title: '存 PDF 報告（插入力計算）', def: `${projName()} 插入力計算`, ext: '.pdf', mime: 'application/pdf', desc: 'PDF 報告',
+      hint: '包含輸入條件、計算結果、插入力曲線、應力-應變工作點與計算方法。',
+      makeBlob: async (n) => {
+        let blob;
+        await withBusy('產生 PDF 報告中…', async () => {
+          const d = insertionReportData();
+          if (!d) throw new Error('目前參數無法計算，請先修正輸入');
+          const { buildInsertionPdf } = await import('./report.js');
+          const r = await buildInsertionPdf({ ...d, name: n, date: new Date().toLocaleString('zh-TW', { hour12: false }) });
+          pages = r.pages; kb = r.blob.size / 1024; blob = r.blob;
+        });
+        if (!blob) throw new Error('PDF 產生失敗');
+        return blob;
+      },
+    });
+  } catch (e) { alert(`錯誤：${e.message}`); }
+  if (name) log(`已輸出插入力 PDF 報告：${safeFileName(name)}.pdf（${pages} 頁，${kb.toFixed(0)} KB）`);
+}
+
 async function exportPdf() {
+  if (state.page === 'ins') return exportInsertionPdf();
   if (!state.parts.length) return alert('目前沒有模型可輸出');
   let pages = 0, kb = 0;
   const build = async (name) => {
@@ -1304,4 +1327,21 @@ $('hiQ').onchange = () => viewer.setHighQuality($('hiQ').checked);
 renderAll();
 
 // 除錯／自動化測試用
-window.mecsim = { state, renderAll, runSimulation, generateMesh, viewer, faceSoup, faceInfo, findFace };
+// ---------- 分頁 ----------
+function setPage(page) {
+  state.page = page === 'ins' ? 'ins' : 'fea';
+  const ins = state.page === 'ins';
+  document.body.classList.toggle('page-ins', ins);
+  $('feaPage').hidden = ins;
+  $('insPage').hidden = !ins;
+  for (const b of $('pageTabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.page === state.page);
+  if (ins) { if (state.anim?.playing) setPlaying(false); requestAnimationFrame(drawInsertion); }
+  else requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+  try { localStorage.setItem('mecsim.page', state.page); } catch {}
+}
+for (const b of $('pageTabs').querySelectorAll('button')) b.onclick = () => setPage(b.dataset.page);
+initInsertion();
+state.page = 'fea';
+try { if (localStorage.getItem('mecsim.page') === 'ins') setPage('ins'); } catch {}
+
+window.mecsim = { state, setPage, renderAll, runSimulation, generateMesh, viewer, faceSoup, faceInfo, findFace };

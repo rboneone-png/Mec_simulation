@@ -8,6 +8,8 @@ import { detectInterfaces, applyInterfaces } from '../src/fea/contact.js';
 import { buildLoads } from '../src/fea/bc.js';
 import { solveStatic } from '../src/fea/solver.js';
 import { hardeningTable } from '../src/fea/plasticity.js';
+import { pressFit, snapFit } from '../src/insertion.js';
+import { MATERIALS } from '../src/materials.js';
 
 const require = createRequire(import.meta.url);
 const occt = await require('occt-import-js')();
@@ -193,6 +195,34 @@ console.log(`${ok3 ? '✔' : '✘'} 超過極限負載時提前終止（完成 $
     if (!ok) failed++;
     console.log(`${ok ? '✔' : '✘'}   ${msg}`);
   }
+}
+
+// ---------- 插入力計算（解析法） ----------
+{
+  console.log('\n[插入力] 壓入配合與懸臂卡扣');
+  const st = MATERIALS.s45c;
+  // 同材料實心軸：p = δE(D²−d²)/(2dD²)
+  const pf = pressFit({ shaft: st, hub: st, d: 20, D: 40, L: 20, delta: 0.02, alpha: 15, mu: 0.15 });
+  const pRef = (0.02 * st.E * (1600 - 400)) / (2 * 20 * 1600);
+  check('壓入配合接觸壓力（Lamé）', pf.p, pRef, 1e-6);
+  check('拔出力 μ·p·πd·L', pf.Fpull, 0.15 * pRef * Math.PI * 20 * 20, 1e-6);
+  check('最大插入力（導角已通過）', pf.Fmax, pf.Fpull, 1e-3);
+  // 塑膠軸套大干涉：依應力-應變曲線的壓力應低於線彈性
+  const pl = pressFit({ shaft: st, hub: MATERIALS.pom, d: 10, D: 16, L: 10, delta: 0.3, alpha: 20, mu: 0.2 });
+  const okPl = pl.p < pl.pLinear * 0.9 && pl.warnings.some((w) => w.includes('降伏'));
+  if (!okPl) failed++;
+  console.log(`${okPl ? '✔' : '✘'}   POM 軸套降伏：p ${pl.p.toFixed(1)} < 線彈性 ${pl.pLinear.toFixed(1)} MPa`);
+  // 卡扣：彈性範圍 P = 3EIy/L³；超過降伏後低於線彈性
+  const pc = MATERIALS.pc;
+  const sf = snapFit({ mat: pc, L: 15, h: 1.5, b: 5, y: 1, alpha: 30, alpha2: 90, mu: 0.3 });
+  const Pref = (3 * pc.E * (5 * 1.5 ** 3) / 12 * 1) / 15 ** 3;
+  check('卡扣撓曲力（彈性）', sf.P, Pref, 2e-3);
+  const t = Math.tan(Math.PI / 6);
+  check('卡扣插入力 P(μ+tanα)/(1−μtanα)', sf.Fin, Pref * (0.3 + t) / (1 - 0.3 * t), 2e-3);
+  const sp = snapFit({ mat: pc, L: 15, h: 1.5, b: 5, y: 5, alpha: 30, alpha2: 90, mu: 0.3 });
+  const okSp = sp.P < sp.Pel * 0.9 && sp.warnings.length > 0;
+  if (!okSp) failed++;
+  console.log(`${okSp ? '✔' : '✘'}   卡扣超過降伏：P ${sp.P.toFixed(2)} < 線彈性 ${sp.Pel.toFixed(2)} N，應變 ${(sp.eps * 100).toFixed(1)}%`);
 }
 
 console.log(failed ? `\n${failed} 項失敗` : '\n全部通過');

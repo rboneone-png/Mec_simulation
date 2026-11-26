@@ -97,7 +97,7 @@ export function drawStressStrain(canvas, m, sim) {
     // 對應點：ε = σ/E + εp（小應變近似）
     const e = maxStress / m.E + (sim.peeq || 0);
     ctx.fillStyle = '#ff5c8a'; ctx.textAlign = 'right';
-    ctx.fillText(`模擬最大 σvm ${fmt(maxStress)}${sim.peeq > 0 ? `・εp ${sim.peeq.toExponential(1)}` : ''}`, W - R - 2, y - 4);
+    ctx.fillText(`${sim.label ?? '模擬最大 σvm'} ${fmt(maxStress)}${sim.peeq > 0 ? `・εp ${sim.peeq.toExponential(1)}` : ''}`, W - R - 2, y - 4);
     if (e <= xMax) { ctx.beginPath(); ctx.arc(X(e), y, 4, 0, Math.PI * 2); ctx.fill(); }
   }
 }
@@ -131,4 +131,59 @@ export function drawCurve(canvas, pts, cur, xLabel, yLabel, title) {
     ctx.fillStyle = i === cur ? '#ff5c8a' : accent;
     ctx.beginPath(); ctx.arc(X(x), Y(y), i === cur ? 5 : 2.5, 0, Math.PI * 2); ctx.fill();
   });
+}
+
+/** 多條曲線 XY 圖：series = [{ pts, color, dash, label, width }]，marks = [{ x, y, label, color }] */
+export function drawXY(canvas, series, { xLabel = '', yLabel = '', title = '', marks = [] } = {}) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (!W || !H) return;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const css = getComputedStyle(document.documentElement);
+  const fg = css.getPropertyValue('--text-dim').trim() || '#9aa4b2', line = css.getPropertyValue('--line').trim() || '#333';
+  const Lm = 58, R = 14, T = 26, B = 34;
+  const all = series.flatMap((s) => s.pts).filter((p) => Number.isFinite(p[1]));
+  const xMax = Math.max(...all.map((p) => p[0]), 1e-9) * 1.04, yMax = Math.max(...all.map((p) => p[1]), 1e-9) * 1.12;
+  const X = (v) => Lm + (v / xMax) * (W - Lm - R), Y = (v) => H - B - (v / yMax) * (H - T - B);
+  ctx.font = '11px system-ui, sans-serif'; ctx.fillStyle = fg; ctx.strokeStyle = line; ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = Y((yMax * i) / 5);
+    ctx.beginPath(); ctx.moveTo(Lm, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(fmt((yMax * i) / 5), Lm - 5, y + 4);
+    ctx.textAlign = 'center'; ctx.fillText(fmt((xMax * i) / 5), X((xMax * i) / 5), H - B + 15);
+  }
+  ctx.textAlign = 'center'; ctx.fillText(xLabel, (Lm + W - R) / 2, H - 4);
+  ctx.save(); ctx.translate(12, (T + H - B) / 2); ctx.rotate(-Math.PI / 2); ctx.fillText(yLabel, 0, 0); ctx.restore();
+  ctx.textAlign = 'left'; ctx.font = '600 12px system-ui, sans-serif'; ctx.fillStyle = css.getPropertyValue('--text').trim() || '#ddd';
+  ctx.fillText(title, Lm, 15);
+  ctx.font = '11px system-ui, sans-serif';
+  // 圖例（右上）
+  let lx = W - R;
+  for (const s of [...series].reverse()) {
+    if (!s.label) continue;
+    const w = ctx.measureText(s.label).width;
+    lx -= w + 30;
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.setLineDash(s.dash || []);
+    ctx.beginPath(); ctx.moveTo(lx, 11); ctx.lineTo(lx + 18, 11); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = fg; ctx.fillText(s.label, lx + 22, 15);
+  }
+  for (const s of series) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.setLineDash(s.dash || []);
+    ctx.beginPath();
+    let started = false;
+    for (const [x, y] of s.pts) {
+      if (!Number.isFinite(y)) { started = false; continue; }
+      if (started) ctx.lineTo(X(x), Y(y)); else { ctx.moveTo(X(x), Y(y)); started = true; }
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  for (const m of marks) {
+    ctx.fillStyle = m.color || '#ff5c8a';
+    ctx.beginPath(); ctx.arc(X(m.x), Y(m.y), 4.5, 0, Math.PI * 2); ctx.fill();
+    const right = X(m.x) > W * 0.65;
+    ctx.textAlign = right ? 'right' : 'left';
+    ctx.fillText(m.label, X(m.x) + (right ? -8 : 8), Y(m.y) - 7);
+  }
 }

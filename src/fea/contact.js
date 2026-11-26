@@ -20,6 +20,12 @@ export const CONTACT_TYPES = {
 };
 export const SPRING_TYPE = { noSeparation: 1, frictionless: 2, rough: 3, frictional: 4 };
 export const DEFAULT_MU = 0.2;
+/** 常見摩擦係數參考值（乾燥、室溫典型值） */
+export const MU_PRESETS = [
+  ['鋼–鋼（乾燥、一般加工面）', 0.3], ['鋼–鋼（潤滑）', 0.1], ['鋼–鋼（噴砂／粗糙面）', 0.5],
+  ['鋁–鋼', 0.45], ['鋁–鋁（乾燥）', 0.5], ['銅–鋼', 0.5], ['鑄鐵–鋼', 0.2],
+  ['工程塑膠（POM／PA）–鋼', 0.2], ['PTFE–鋼', 0.05], ['橡膠–鋼', 0.8],
+];
 
 /** 結合設定值可為字串（類型）或 { type, mu } */
 const norm = (v) => (typeof v === 'string' ? { type: v } : v || { type: 'bonded' });
