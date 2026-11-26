@@ -23,7 +23,7 @@ function makePart(name, positions, normals, faceOfTri, faceCount, color) {
   geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(positions.length), 3));
   geometry.computeBoundingBox();
   const id = ++partSeq;
-  // 體積與質心（散度定理），供 Gmsh 幾何比對
+  // 體積與質心（散度定理）
   let V = 0;
   const c = [0, 0, 0];
   for (let i = 0; i < positions.length; i += 9) {

@@ -1,6 +1,6 @@
 // 常駐 Worker：保留網格於記憶體，處理「產生網格」與「求解」
 import { voxelMesh } from './fea/mesh-voxel.js';
-import { gmshMesh } from './fea/mesh-gmsh.js';
+import { tetwildMesh } from './fea/mesh-tetwild.js';
 import { buildLoads } from './fea/bc.js';
 import { solveStatic } from './fea/solver.js';
 
@@ -16,8 +16,7 @@ self.onmessage = async (e) => {
       const t0 = Date.now();
       mesh = null;
       if (data.method === 'tet') {
-        const threads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
-        mesh = await gmshMesh(data.files, data.parts, { size: data.size, curvature: data.curvature, threads }, progress);
+        mesh = await tetwildMesh(data.parts, { size: data.size }, progress);
       } else {
         progress({ stage: '體素化', frac: 0.2 });
         mesh = voxelMesh(data.parts, data.size);

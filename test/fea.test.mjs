@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { voxelMesh } from '../src/fea/mesh-voxel.js';
-import { gmshMesh } from '../src/fea/mesh-gmsh.js';
+import { tetwildMesh } from '../src/fea/mesh-tetwild.js';
 import { buildLoads } from '../src/fea/bc.js';
 import { solveStatic } from '../src/fea/solver.js';
 import { hardeningTable } from '../src/fea/plasticity.js';
@@ -25,6 +25,8 @@ function loadStep(path) {
     const soup = (t0, t1) => { const o = []; for (let t = t0; t <= t1; t++) for (let k = 0; k < 3; k++) { const v = I[3 * t + k]; o.push(P[3 * v], P[3 * v + 1], P[3 * v + 2]); } return Float32Array.from(o); };
     const positions = soup(0, I.length / 3 - 1);
     const faces = m.brep_faces.map((f) => soup(f.first, f.last));
+    const faceOfTri = new Int32Array(I.length / 3);
+    m.brep_faces.forEach((f, fi) => { for (let t = f.first; t <= f.last; t++) faceOfTri[t] = fi; });
     // 質心與體積
     let V = 0; const c = [0, 0, 0];
     for (let i = 0; i < positions.length; i += 9) {
@@ -34,7 +36,7 @@ function loadStep(path) {
     }
     const bbox = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
     for (let i = 0; i < positions.length; i += 3) for (let d = 0; d < 3; d++) { bbox[d] = Math.min(bbox[d], positions[i + d]); bbox[3 + d] = Math.max(bbox[3 + d], positions[i + d]); }
-    return { name: `p${mi}`, positions, faces, com: c.map((x) => x / V), volume: V, bbox, fileIdx: 0 };
+    return { name: `p${mi}`, positions, faces, faceOfTri, com: c.map((x) => x / V), volume: V, bbox, fileIdx: 0 };
   });
 }
 /** 找出中心座標在某軸為極值的面 */
@@ -45,7 +47,7 @@ const faceAt = (part, axis, sign) => {
     const v = (sign * s) / (f.length / 3);
     if (v > bv) { bv = v; best = i; }
   });
-  return { part: 0, soup: part.faces[best] };
+  return { part: 0, faceId: best, soup: part.faces[best] };
 };
 
 const steel = { name: 'steel', E: 200000, nu: 0.3, sy: 250, su: 400, eu: 0.18 };
@@ -63,7 +65,7 @@ const beamBCs = (p) => [
 
 for (const [label, mesh] of [
   ['HEX8 體素 h=2.5', voxelMesh(beam, 2.5)],
-  ['TET10 Gmsh h=6', await gmshMesh([{ bytes: fs.readFileSync('test/data/beam.step') }], beam, { size: 6, curvature: false })],
+  ['TET10 fTetWild h=6', await tetwildMesh(beam, { size: 6 })],
 ]) {
   const { fixed, F: Fv } = buildLoads(mesh, beamBCs(beam[0]));
   const r = solveStatic(mesh, { materials: [steel], fixed, F: Fv, tol: 1e-8 });
@@ -81,7 +83,7 @@ for (const [label, mesh] of [
 
 // ---------- 2. 單軸拉伸（彈塑性，TET10） ----------
 const bar = loadStep('test/data/bar.step');
-const mesh = await gmshMesh([{ bytes: fs.readFileSync('test/data/bar.step') }], bar, { size: 4, curvature: false });
+const mesh = await tetwildMesh(bar, { size: 4 });
 const A = 100, sigma = 330; // 超過降伏 250 MPa
 const bcs = [
   { name: 'x0', type: 'fixed', dirs: [true, false, false], faces: [faceAt(bar[0], 0, -1)] },

@@ -4,16 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MecSim 應力應變模擬</title>
-  <script>
-    // 讓 Gmsh（多執行緒 WASM）在無法設定標頭的靜態主機（如 GitHub Pages）上也能運作
-    if (!window.crossOriginIsolated && window.isSecureContext && 'serviceWorker' in navigator && !/^(localhost|127\.)/.test(location.hostname)) {
-      navigator.serviceWorker.register('coi-sw.js').then((reg) => {
-        const reload = () => { if (!sessionStorage.getItem('coiReloaded')) { sessionStorage.setItem('coiReloaded', '1'); location.reload(); } };
-        if (reg.active && !navigator.serviceWorker.controller) reload();
-        navigator.serviceWorker.addEventListener('controllerchange', reload);
-      }).catch((e) => console.warn('COI service worker 註冊失敗', e));
-    }
-  </script>
   <link rel="stylesheet" href="./src/style.css" />
 </head>
 <body>
@@ -60,13 +50,11 @@
         <h3>網格</h3>
         <div class="grid2">
           <label class="full">網格方法<select id="meshMethod">
-            <option value="tet">四面體 TET10（Gmsh，貼合曲面）</option>
+            <option value="tet">四面體 TET10（fTetWild，貼合曲面）</option>
             <option value="voxel">體素 HEX8（快速預覽）</option>
           </select></label>
           <label>元素尺寸 [mm]<input id="meshSize" type="number" step="any" min="0" placeholder="自動" /></label>
-          <label class="check" style="align-self:end"><input id="meshCurv" type="checkbox" checked /> 依曲率加密</label>
         </div>
-        <div class="note" id="coiNote" hidden></div>
         <button id="btnMesh" class="btn sm block2">產生網格</button>
         <div class="mesh-info" id="meshInfo">尚未產生網格</div>
       </section>

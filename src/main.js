@@ -25,7 +25,6 @@ const state = {
 };
 let bcSeq = 0;
 const viewer = new Viewer($('canvasHost'));
-const COI = !!window.crossOriginIsolated;
 
 // ---------- Worker ----------
 class FeaClient {
@@ -386,12 +385,6 @@ function changedBc() { invalidateResults(); refreshBcMeta(); repaint(); }
 
 function renderMeshInfo() {
   const m = state.mesh;
-  const tetOk = COI;
-  const opt = $('meshMethod').querySelector('[value=tet]');
-  opt.disabled = !tetOk;
-  if (!tetOk && $('meshMethod').value === 'tet') $('meshMethod').value = 'voxel';
-  $('coiNote').hidden = tetOk;
-  $('coiNote').textContent = '此頁面未啟用跨來源隔離，四面體網格（Gmsh）無法使用；請重新整理頁面，或改用體素網格。';
   $('meshSize').placeholder = `自動 ≈ ${fmt(autoMeshSize(), 2)}`;
   if (!m) { $('meshInfo').textContent = state.parts.length ? '尚未產生網格（執行模擬時會自動產生）' : '尚未產生網格'; return; }
   $('meshInfo').innerHTML = `<b>${m.type === 'tet10' ? 'TET10 二次四面體' : 'HEX8 體素'}</b>・元素 <b>${m.elemCount.toLocaleString()}</b>・節點 <b>${m.nodeCount.toLocaleString()}</b>・尺寸 ${fmt(m.size)} mm・${m.seconds.toFixed(1)} s`;
@@ -531,12 +524,8 @@ async function generateMesh() {
   const method = $('meshMethod').value;
   const size = +$('meshSize').value || autoMeshSize();
   const data = {
-    method, size, curvature: $('meshCurv').checked,
-    files: method === 'tet' ? state.files.map((f) => ({ name: f.name, bytes: f.bytes })) : [],
-    parts: state.parts.map((p) => ({
-      name: p.name, fileIdx: p.fileIdx, com: p.com, volume: p.volume, bbox: p.bbox,
-      positions: method === 'voxel' ? p.basePositions : undefined,
-    })),
+    method, size,
+    parts: state.parts.map((p) => ({ name: p.name, bbox: p.bbox, positions: p.basePositions, faceOfTri: p.faceOfTri })),
   };
   log(`產生網格（${method === 'tet' ? 'TET10' : 'HEX8'}，尺寸 ${fmt(size)} mm）…`);
   const res = await fea.call('mesh', data, onProgress);
@@ -568,7 +557,7 @@ async function runSimulation() {
     if (!state.mesh) await generateMesh();
     const bcs = state.bcs.filter((b) => b.faces.size).map((b) => ({
       name: b.name, type: b.type, dirs: b.dirs, vector: b.vector, p: b.p,
-      faces: [...b.faces].map((k) => { const [pid, fid] = k.split(':').map(Number); return { part: partIndex(pid), soup: faceSoup(partById(pid), fid) }; }),
+      faces: [...b.faces].map((k) => { const [pid, fid] = k.split(':').map(Number); return { part: partIndex(pid), faceId: fid, soup: faceSoup(partById(pid), fid) }; }),
     }));
     const plastic = $('anaType').value === 'plastic';
     const setup = {
