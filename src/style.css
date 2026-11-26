@@ -138,3 +138,13 @@ body:not(.plastic) .plastic-only { display: none !important; }
 .seg-sm button { padding: 3px 12px; font-size: 12px; }
 .seg-sm { align-self: center; justify-self: start; }
 .btn.rec { background: #c0392b; border-color: #c0392b; color: #fff; }
+
+.mat-cat { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.tag.metal { background: color-mix(in srgb, #8fa3b8 30%, transparent); color: #c9d6e3; }
+.tag.plastic { background: color-mix(in srgb, #c98ad6 28%, transparent); color: #e3b8ec; }
+.contact-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; padding: 6px 8px; border-radius: 6px; background: var(--panel-2); margin-bottom: 4px; }
+.contact-row .pair { font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contact-row .area { font-size: 11px; color: var(--text-dim); }
+.contact-row select { grid-column: 1 / -1; }
+.contact-all { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; font-size: 12px; color: var(--text-dim); }
+.contact-all select { flex: 1; }

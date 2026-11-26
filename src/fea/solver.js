@@ -4,8 +4,13 @@ import { ELEMENTS, precomputeGeometry } from './elements.js';
 import { updateJ2, elasticD, hardeningTable, vonMises } from './plasticity.js';
 
 /** 依節點相鄰關係建立 3×3 區塊 CSR */
-function buildCSR(nNode, elems, nen, act) {
+function buildCSR(nNode, elems, nen, act, springs) {
   const nbr = Array.from({ length: nNode }, () => null);
+  if (springs)
+    for (let q = 0; q < springs.a.length; q++) {
+      const a = springs.a[q], b = springs.b[q];
+      for (const [i, j] of [[a, a], [a, b], [b, a], [b, b]]) { let s2 = nbr[i]; if (!s2) s2 = nbr[i] = new Set(); s2.add(j); }
+    }
   for (const e of act) {
     const o = e * nen;
     for (let a = 0; a < nen; a++) {
@@ -38,7 +43,13 @@ function buildCSR(nNode, elems, nen, act) {
     for (let a = 0; a < nen; a++)
       for (let b = 0; b < nen; b++) blk[(ai * nen + a) * nen + b] = find(elems[o + a], elems[o + b]);
   });
-  return { rowPtr, col, val: new Float64Array(9 * col.length), blk };
+  // 彈簧的四個區塊位置：aa, ab, ba, bb
+  const spBlk = springs ? new Int32Array(springs.a.length * 4) : null;
+  if (springs) for (let q = 0; q < springs.a.length; q++) {
+    const a = springs.a[q], b = springs.b[q];
+    spBlk[4 * q] = find(a, a); spBlk[4 * q + 1] = find(a, b); spBlk[4 * q + 2] = find(b, a); spBlk[4 * q + 3] = find(b, b);
+  }
+  return { rowPtr, col, val: new Float64Array(9 * col.length), blk, spBlk };
 }
 
 function csrMul(A, x, y, free) {
@@ -211,7 +222,11 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   const { elems, elemPart } = mesh;
   const warnings = [];
   const { fixed, F, materials } = setup;
+  const springs = setup.springs || null;
+  const nSpr = springs ? springs.a.length : 0;
   const plastic = !!setup.plastic;
+  const contactNL = !!springs && springs.type.some((t) => t >= 2);
+  const nonlinear = plastic || contactNL;
   const nSteps = plastic ? Math.max(1, setup.steps | 0) : 1;
   const loadFactor = setup.loadFactor ?? 1;
   const linTol = setup.tol ?? 1e-6;
@@ -224,6 +239,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     const r0 = find(elems[e * nen]);
     for (let a = 1; a < nen; a++) { const r = find(elems[e * nen + a]); if (r !== r0) parent[r] = r0; }
   }
+  for (let q = 0; q < nSpr; q++) { const ra = find(springs.a[q]), rb = find(springs.b[q]); if (ra !== rb) parent[rb] = ra; }
   const anchored = new Set();
   for (let n = 0; n < nNode; n++) if (fixed[3 * n] || fixed[3 * n + 1] || fixed[3 * n + 2]) anchored.add(find(n));
   if (!anchored.size) throw new Error('至少需要一個「固定約束」才能求解');
@@ -252,7 +268,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   }));
 
   progress({ stage: '建立稀疏矩陣', frac: 0.05 });
-  const A = buildCSR(nNode, elems, nen, act);
+  const A = buildCSR(nNode, elems, nen, act, springs);
 
   // --- 狀態 ---
   const nGp = nA * ng;
@@ -265,7 +281,12 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   const Ke = new Float64Array(9 * nen * nen);
 
   /** 由位移 u 計算內力（並視需要組裝切線勁度） */
-  const assemble = (u, wantK) => {
+  // 接觸狀態（1 = 閉合）：Newton 迭代間保留，避免開／閉來回震盪
+  const sprState = new Uint8Array(nSpr).fill(1);
+  let sprChanges = 0, sprFrozen = false;
+  const STAB = 1e-6; // 穩定化勁度比例（僅防止剛體模態，不應承受實質負載）
+  const assemble = (u, wantK, updateContact = false) => {
+    if (updateContact) sprChanges = 0;
     const fint = new Float64Array(nDof);
     if (wantK) A.val.fill(0);
     for (let ai = 0; ai < nA; ai++) {
@@ -327,6 +348,32 @@ export function solveStatic(mesh, setup, progress = () => {}) {
             for (let j = 0; j < 3; j++) A.val[v + 3 * i + j] += Ke[(3 * a + i) * C + 3 * b + j];
         }
     }
+    // 介面彈簧（罰函數）：d = u_b − u_a，g = n·d（< 0 為穿透）
+    for (let q = 0; q < nSpr; q++) {
+      const a = 3 * springs.a[q], b = 3 * springs.b[q];
+      const nx = springs.n[3 * q], ny = springs.n[3 * q + 1], nz = springs.n[3 * q + 2];
+      const k = springs.k[q], t = springs.type[q];
+      const dx = u[b] - u[a], dy = u[b + 1] - u[a + 1], dz = u[b + 2] - u[a + 2];
+      const g = nx * dx + ny * dy + nz * dz;
+      if (updateContact && t !== 1 && !sprFrozen) {
+        const ns = g <= 0 ? 1 : 0;
+        if (ns !== sprState[q]) { sprState[q] = ns; sprChanges++; }
+      }
+      const closed = t === 1 || sprState[q] === 1;
+      const kn = closed ? k : k * STAB; // 分離時保留微小勁度（穩定化）
+      const kt = t === 3 && closed ? k : k * STAB; // 微小切向勁度：避免可滑動零件產生剛體模態
+      const nn = [nx, ny, nz];
+      const K = new Float64Array(9);
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) K[3 * i + j] = (kn - kt) * nn[i] * nn[j] + (i === j ? kt : 0);
+      const d = [dx, dy, dz];
+      for (let i = 0; i < 3; i++) {
+        const f = K[3 * i] * d[0] + K[3 * i + 1] * d[1] + K[3 * i + 2] * d[2];
+        fint[b + i] += f; fint[a + i] -= f;
+      }
+      if (!wantK) continue;
+      const [aa, ab, ba, bb] = [A.spBlk[4 * q], A.spBlk[4 * q + 1], A.spBlk[4 * q + 2], A.spBlk[4 * q + 3]];
+      for (let i = 0; i < 9; i++) { A.val[9 * aa + i] += K[i]; A.val[9 * bb + i] += K[i]; A.val[9 * ab + i] -= K[i]; A.val[9 * ba + i] -= K[i]; }
+    }
     return fint;
   };
 
@@ -381,35 +428,36 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     const lam = Math.min(lamDone + dLam, lamTarget(k));
     uSave.set(u);
     let converged = false, it = 0;
-    const maxIt = plastic ? 15 : 1;
+    const maxIt = nonlinear ? (plastic ? 15 : 30) : 1;
     let prevRn = Infinity;
     for (; it < maxIt; it++) {
-      const fint = assemble(u, true);
+      if (contactNL && it === 12) sprFrozen = true; // 迭代過多：凍結接觸狀態
+      const fint = assemble(u, true, contactNL);
       const r = new Float64Array(nDof);
       for (let d = 0; d < nDof; d++) r[d] = free[d] ? lam * Fe[d] - fint[d] : 0;
       const rn = norm(r) / (lam * Fn);
       lastRes = rn;
-      if (it > 0 && rn < nlTol) { converged = true; break; }
+      if (it > 0 && rn < nlTol && sprChanges === 0) { converged = true; break; }
       // 發散判斷：殘差非有限、暴增，或多次迭代後仍無明顯下降
-      if (!Number.isFinite(rn) || (it > 2 && rn > 10 * prevRn) || (it >= 8 && rn > 1e-2)) break;
+      if (!Number.isFinite(rn) || (plastic && ((it > 2 && rn > 10 * prevRn) || (it >= 8 && rn > 1e-2)))) break;
       prevRn = rn;
       const du = new Float64Array(nDof);
       // 熱啟動：每步第一次迭代以前一步增量（依負載增量比例縮放）作為初始猜測
       if (plastic && it === 0 && lastDLam > 0) { const sc = (lam - lamDone) / lastDLam; for (let d = 0; d < nDof; d++) du[d] = lastInc[d] * sc; }
       // 非精確 Newton：線性求解容許誤差隨殘差調整（收斂仍以真實殘差判斷）
-      const cgTol = plastic ? Math.min(1e-2, Math.max(linTol, (0.3 * nlTol) / Math.max(rn, 1e-12))) : linTol;
+      const cgTol = nonlinear ? Math.min(1e-2, Math.max(linTol, (0.3 * nlTol) / Math.max(rn, 1e-12))) : linTol;
       const cgMax = plastic ? Math.max(3000, Math.round(Math.sqrt(nDof) * 40)) : 50000;
       // 前置條件：每個負載步只分解一次，Newton 迭代間重複使用（切線矩陣變化不大）
       if (it === 0 || !prec) prec = makePreconditioner(A, free);
       const res = pcg(A, r, du, free, cgTol, cgMax, (ci, cr) =>
-        progress({ stage: plastic ? `負載步 ${k}/${nSteps}・Newton ${it + 1}` : '求解線性系統', frac: 0.08 + (0.85 * (lamDone + (lam - lamDone) * 0.5)) / loadFactor, iter: ci, residual: cr }), prec);
+        progress({ stage: plastic ? `負載步 ${k}/${nSteps}・Newton ${it + 1}` : contactNL ? `接觸迭代 ${it + 1}` : '求解線性系統', frac: 0.08 + (0.85 * (lamDone + (lam - lamDone) * 0.5)) / loadFactor, iter: ci, residual: cr }), prec);
       totalCG += res.iterations;
       if (plastic && !(res.residual < Math.max(0.05, cgTol * 5))) break; // 切線矩陣近奇異（接近極限負載）
       for (let d = 0; d < nDof; d++) u[d] += du[d];
       totalNewton++;
-      if (!plastic) { assemble(u, false); converged = true; lastRes = res.residual; break; }
+      if (!nonlinear) { assemble(u, false); converged = true; lastRes = res.residual; break; }
     }
-    if (!converged && plastic) {
+    if (!converged && nonlinear) {
       // 最後再檢查一次殘差
       const fint = assemble(u, false);
       let s = 0;
@@ -446,6 +494,37 @@ export function solveStatic(mesh, setup, progress = () => {}) {
   }
   if (!steps.length) throw new Error('第一個負載步即無法收斂，請降低負載或檢查邊界條件');
 
+  let contact = null;
+  if (nSpr) {
+    let closed = 0, maxPen = 0;
+    for (let q = 0; q < nSpr; q++) {
+      const a = 3 * springs.a[q], b = 3 * springs.b[q];
+      const g = springs.n[3 * q] * (u[b] - u[a]) + springs.n[3 * q + 1] * (u[b + 1] - u[a + 1]) + springs.n[3 * q + 2] * (u[b + 2] - u[a + 2]);
+      if (springs.type[q] === 1 || sprState[q] === 1) closed++;
+      if (g < 0) maxPen = Math.max(maxPen, -g);
+    }
+    // 穩定化彈簧承受的力（應趨近 0；過大代表零件可自由滑動／分離＝機構）
+    let fStab = 0, fApplied = 0;
+    for (let q = 0; q < nSpr; q++) {
+      const a = 3 * springs.a[q], b = 3 * springs.b[q], t = springs.type[q], k = springs.k[q];
+      const n = [springs.n[3 * q], springs.n[3 * q + 1], springs.n[3 * q + 2]];
+      const d = [u[b] - u[a], u[b + 1] - u[a + 1], u[b + 2] - u[a + 2]];
+      const g = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+      const closed = t === 1 || sprState[q] === 1;
+      const tan = d.map((v, i) => v - g * n[i]);
+      let f2 = 0;
+      if (!(t === 3 && closed)) f2 += (k * STAB) ** 2 * (tan[0] ** 2 + tan[1] ** 2 + tan[2] ** 2);
+      if (!closed) f2 += (k * STAB * g) ** 2;
+      fStab += Math.sqrt(f2);
+    }
+    for (let n = 0; n < nNode; n++) fApplied += Math.hypot(Fe[3 * n], Fe[3 * n + 1], Fe[3 * n + 2]) * loadFactor;
+    const stabRatio = fApplied > 0 ? fStab / fApplied : 0;
+    if (stabRatio > 0.01)
+      warnings.push(`約 ${(stabRatio * 100).toFixed(0)}% 的負載由接觸穩定化彈簧承受：可滑動或可分離的零件缺乏足夠支撐（形成機構），結果不具物理意義。請增加拘束，或將相關介面改為「黏合」或「粗糙接觸」`);
+    contact = { springs: nSpr, closed, maxPen, frozen: sprFrozen, stabRatio };
+    if (sprFrozen) warnings.push('接觸狀態在迭代中來回變化，已於第 12 次迭代凍結；接觸邊界附近的結果請謹慎判讀');
+    if (contactNL && closed === 0) warnings.push('所有接觸面皆已分離，零件僅由穩定化彈簧支撐（位移結果無物理意義），請檢查負載方向或改用黏合／無分離');
+  }
   const partElems = new Array(materials.length).fill(0);
   for (const e of act) partElems[elemPart[e]]++;
   progress({ stage: '完成', frac: 1 });
@@ -454,6 +533,7 @@ export function solveStatic(mesh, setup, progress = () => {}) {
     used,
     partElems,
     warnings,
+    contact,
     stats: {
       type: mesh.type, elements: nA, nodes: used.reduce((s, v) => s + v, 0), dofs: free.reduce((s, v) => s + v, 0),
       newton: totalNewton, cg: totalCG, residual: lastRes, seconds: (Date.now() - t0) / 1000, plastic,
